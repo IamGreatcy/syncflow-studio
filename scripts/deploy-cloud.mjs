@@ -54,7 +54,20 @@ async function main() {
   } else {
     console.log('No source changes to commit.');
   }
-  run('git push origin HEAD:release --force');
+  async function pushWithRetry() {
+    const maxAttempts = 4;
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      try {
+        run('git push origin HEAD:release --force');
+        return;
+      } catch (err) {
+        if (attempt === maxAttempts) throw err;
+        console.log(`Push failed (attempt ${attempt}/${maxAttempts}) — retrying in ${attempt * 5}s…`);
+        await new Promise((r) => setTimeout(r, attempt * 5000));
+      }
+    }
+  }
+  await pushWithRetry();
 
   console.log('3/4 Restart the cloud service so it pulls the latest release');
   const before = await readHealth(cloudUrl);
