@@ -4,7 +4,8 @@ import Busboy from 'busboy';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
+import { createHmac, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
+import { getCookie, setCookie } from 'hono/cookie';
 import { pipeline } from 'node:stream/promises';
 import { Readable } from 'node:stream';
 import { z } from 'zod';
@@ -27,6 +28,52 @@ const MIME_BY_EXT = {
     '.ico': 'image/x-icon',
     '.woff2': 'font/woff2',
 };
+const LOGIN_PAGE_HTML = `<!doctype html>
+<html lang="th">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>SyncFlow Studio — เข้าสู่ระบบ</title>
+<style>
+  *{box-sizing:border-box}
+  body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","Noto Sans Thai",sans-serif;
+    background:linear-gradient(160deg,#eef1ff,#f7f7fb 55%,#e9f6ff);color:#1c1c1e}
+  .card{width:min(92vw,380px);background:#fff;border-radius:22px;padding:32px 28px;
+    box-shadow:0 18px 50px rgba(30,40,90,.14)}
+  h1{font-size:20px;margin:0 0 4px}
+  p{margin:0 0 20px;color:#6b6b73;font-size:13.5px}
+  input{width:100%;padding:13px 14px;font-size:16px;border:1px solid #d9d9e0;border-radius:12px;outline:none}
+  input:focus{border-color:#007aff;box-shadow:0 0 0 3px rgba(0,122,255,.15)}
+  button{width:100%;margin-top:14px;padding:13px;font-size:16px;font-weight:600;color:#fff;
+    background:#007aff;border:0;border-radius:12px;cursor:pointer}
+  button:disabled{opacity:.6}
+  .err{min-height:20px;margin-top:12px;color:#ff3b30;font-size:13px}
+</style>
+</head>
+<body>
+<form class="card" id="f">
+  <h1>SyncFlow Studio</h1>
+  <p>กรอกรหัสผ่านครั้งเดียว ระบบจะจำไว้ในอุปกรณ์นี้ 30 วัน</p>
+  <input id="p" name="passcode" type="password" placeholder="รหัสผ่าน" autocomplete="current-password" autofocus />
+  <button id="b" type="submit">เข้าสู่ระบบ</button>
+  <div class="err" id="e"></div>
+</form>
+<script>
+  const f=document.getElementById('f'),p=document.getElementById('p'),b=document.getElementById('b'),e=document.getElementById('e');
+  f.addEventListener('submit',async(ev)=>{
+    ev.preventDefault();e.textContent='';b.disabled=true;
+    try{
+      const r=await fetch('/api/auth/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({passcode:p.value})});
+      const d=await r.json().catch(()=>({}));
+      if(r.ok){location.reload();return;}
+      e.textContent=d.error||'เข้าสู่ระบบไม่สำเร็จ';
+    }catch{e.textContent='เชื่อมต่อเซิร์ฟเวอร์ไม่ได้';}
+    b.disabled=false;
+  });
+</script>
+</body>
+</html>`;
 export function createApp(params) {
     const { db, storage, scheduler } = params;
     const app = new Hono();
@@ -119,6 +166,11 @@ export function createApp(params) {
             return false;
         return timingSafeEqual(bufA, bufB);
     }
+    const SESSION_COOKIE = 'sf_session';
+    const loginAttempts = new Map();
+    function sessionTokenFor(passcode) {
+        return createHmac('sha256', passcode).update('syncflow-session-v1').digest('hex');
+    }
     app.use('/api/*', cors({
         origin: '*',
         allowMethods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
@@ -133,7 +185,13 @@ export function createApp(params) {
         }
         const reqPath = c.req.path;
         if (reqPath === '/api/health' ||
+            reqPath === '/api/auth/login' ||
             /^\/api\/oauth\/[^/]+\/callback$/i.test(reqPath)) {
+            await next();
+            return;
+        }
+        const sessionCookie = getCookie(c, SESSION_COOKIE);
+        if (sessionCookie && safePasscodeEquals(sessionCookie, sessionTokenFor(passcode))) {
             await next();
             return;
         }
@@ -164,11 +222,49 @@ export function createApp(params) {
                 // Invalid base64
             }
         }
-        c.header('WWW-Authenticate', 'Basic realm="SyncFlow Studio"');
         if (reqPath.startsWith('/api/')) {
             return c.json({ error: 'Unauthorized: STUDIO_PASSCODE required' }, 401);
         }
-        return c.text('Authentication required (STUDIO_PASSCODE)', 401);
+        return c.html(LOGIN_PAGE_HTML, 401);
+    });
+    app.post('/api/auth/login', async (c) => {
+        const passcode = process.env.STUDIO_PASSCODE?.trim();
+        if (!passcode) {
+            return c.json({ ok: true, authRequired: false });
+        }
+        const ip = c.req.header('x-forwarded-for')?.split(',')[0]?.trim() ||
+            c.req.header('x-real-ip') ||
+            'local';
+        const now = Date.now();
+        const entry = loginAttempts.get(ip);
+        if (entry && entry.resetAt > now && entry.count >= 8) {
+            return c.json({ error: 'ลองรหัสผิดหลายครั้งเกินไป กรุณารอ 1 นาทีแล้วลองใหม่' }, 429);
+        }
+        let supplied = '';
+        try {
+            const body = (await c.req.json());
+            supplied = typeof body.passcode === 'string' ? body.passcode.trim() : '';
+        }
+        catch {
+            supplied = '';
+        }
+        if (!supplied || !safePasscodeEquals(supplied, passcode)) {
+            loginAttempts.set(ip, {
+                count: entry && entry.resetAt > now ? entry.count + 1 : 1,
+                resetAt: entry && entry.resetAt > now ? entry.resetAt : now + 60_000,
+            });
+            return c.json({ error: 'รหัสผ่านไม่ถูกต้อง' }, 401);
+        }
+        loginAttempts.delete(ip);
+        const proto = c.req.header('x-forwarded-proto')?.split(',')[0]?.trim() || '';
+        setCookie(c, SESSION_COOKIE, sessionTokenFor(passcode), {
+            httpOnly: true,
+            sameSite: 'Lax',
+            secure: proto === 'https',
+            path: '/',
+            maxAge: 60 * 60 * 24 * 30,
+        });
+        return c.json({ ok: true });
     });
     // ---------- Health ----------
     app.get('/api/health', async (c) => {
@@ -1678,6 +1774,22 @@ export function createApp(params) {
         finally {
             await fs.promises.unlink(tmpDbPath).catch(() => { });
         }
+    });
+    // ---------- One-click Cloud Update (restart → re-pull latest release) ----------
+    app.post('/api/admin/restart', (c) => {
+        const passcode = process.env.STUDIO_PASSCODE?.trim();
+        const encKey = process.env.ENCRYPTION_KEY?.trim();
+        const adminHeader = c.req.header('x-admin-key')?.trim();
+        const hasAdminKey = Boolean(encKey && adminHeader && safePasscodeEquals(adminHeader, encKey));
+        if (!passcode && !hasAdminKey) {
+            return c.json({ error: 'Admin endpoint requires STUDIO_PASSCODE or x-admin-key' }, 403);
+        }
+        if (!params.onRestartRequested) {
+            return c.json({ error: 'Restart is not supported in this runtime' }, 501);
+        }
+        const trigger = params.onRestartRequested;
+        setTimeout(trigger, 400);
+        return c.json({ ok: true, message: 'Restarting to apply the latest release…' });
     });
     // ---------- Production Web SPA Static Fallback ----------
     if (params.webDistDir && fs.existsSync(params.webDistDir)) {

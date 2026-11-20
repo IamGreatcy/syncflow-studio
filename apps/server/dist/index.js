@@ -25,7 +25,24 @@ ensureInitialSeed(db);
 const storage = new StorageService(dataDir);
 const scheduler = new SchedulerEngine(db, storage);
 const webDistDir = path.join(repoRoot, 'apps', 'web', 'dist');
-const app = createApp({ db, storage, scheduler, webDistDir });
+const app = createApp({
+    db,
+    storage,
+    scheduler,
+    webDistDir,
+    onRestartRequested: () => {
+        // Exit non-zero so the host (Railway restart policy / Docker) restarts the container
+        // and the start command re-pulls the latest release.
+        scheduler.stop();
+        try {
+            db.close();
+        }
+        catch {
+            // ignore
+        }
+        process.exit(1);
+    },
+});
 const port = Number(process.env.PORT || 3001);
 const hostname = process.env.HOST?.trim() || '0.0.0.0';
 scheduler.start(15_000);

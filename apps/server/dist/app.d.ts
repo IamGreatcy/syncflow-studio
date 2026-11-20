@@ -7,5 +7,6 @@ export declare function createApp(params: {
     storage: StorageService;
     scheduler: SchedulerEngine;
     webDistDir?: string;
+    onRestartRequested?: () => void;
 }): Hono<import("hono/types").BlankEnv, import("hono/types").BlankSchema, "/">;
 //# sourceMappingURL=app.d.ts.map

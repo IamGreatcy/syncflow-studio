@@ -31,10 +31,52 @@ describe('Cloud / Reverse-Proxy Readiness & STUDIO_PASSCODE Lock', () => {
       process.env.STUDIO_PASSCODE = 'secret-pass-2026';
       delete process.env.APP_BASE_URL;
 
-      // 1. Protected routes require passcode
+      // 1. Protected routes require passcode (JSON for API, friendly login page for browsers)
       const deniedRes = await app.request('http://localhost:3001/api/channels');
       assert.equal(deniedRes.status, 401);
-      assert.ok((deniedRes.headers.get('www-authenticate') || '').includes('Basic'));
+      assert.equal(
+        deniedRes.headers.get('www-authenticate'),
+        null,
+        'must not trigger the browser Basic-Auth popup'
+      );
+      const pageRes = await app.request('http://localhost:3001/', {
+        headers: { accept: 'text/html' },
+      });
+      assert.equal(pageRes.status, 401);
+      assert.ok((await pageRes.text()).includes('name="passcode"'));
+
+      // 1b. Login form: wrong passcode rejected, correct passcode issues a session cookie
+      const badLogin = await app.request('http://localhost:3001/api/auth/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ passcode: 'wrong' }),
+      });
+      assert.equal(badLogin.status, 401);
+
+      const goodLogin = await app.request('http://localhost:3001/api/auth/login', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-forwarded-proto': 'https',
+        },
+        body: JSON.stringify({ passcode: 'secret-pass-2026' }),
+      });
+      assert.equal(goodLogin.status, 200);
+      const setCookieHeader = goodLogin.headers.get('set-cookie') || '';
+      assert.ok(setCookieHeader.includes('sf_session='));
+      assert.ok(/HttpOnly/i.test(setCookieHeader));
+      assert.ok(/Secure/i.test(setCookieHeader));
+      const cookiePair = setCookieHeader.split(';')[0];
+
+      const cookieRes = await app.request('http://localhost:3001/api/channels', {
+        headers: { cookie: cookiePair },
+      });
+      assert.equal(cookieRes.status, 200);
+
+      const forgedRes = await app.request('http://localhost:3001/api/channels', {
+        headers: { cookie: 'sf_session=deadbeef' },
+      });
+      assert.equal(forgedRes.status, 401);
 
       // 2. /api/health stays accessible for Railway/Render/Docker probes
       const healthRes = await app.request('http://localhost:3001/api/health');
@@ -142,6 +184,28 @@ describe('Cloud / Reverse-Proxy Readiness & STUDIO_PASSCODE Lock', () => {
       assert.equal(okJson.imported.rules, 42);
       assert.equal(dstDb.getSettingsFull().aiApiKey, 'test-key-123');
       assert.ok(fs.existsSync(path.join(storage.thumbnailsDir, 'med_abc123', 'custom_cover.jpg')));
+
+      // One-click cloud update: restart endpoint is guarded and only fires the injected hook
+      let restartCalls = 0;
+      const restartApp = createApp({
+        db: dstDb,
+        storage,
+        scheduler,
+        onRestartRequested: () => {
+          restartCalls++;
+        },
+      });
+      const noAuthRestart = await restartApp.request('http://localhost:3001/api/admin/restart', {
+        method: 'POST',
+      });
+      assert.equal(noAuthRestart.status, 401);
+      const okRestart = await restartApp.request('http://localhost:3001/api/admin/restart', {
+        method: 'POST',
+        headers: { Authorization: 'Bearer cloud-import-pass' },
+      });
+      assert.equal(okRestart.status, 200);
+      await new Promise((r) => setTimeout(r, 600));
+      assert.equal(restartCalls, 1);
     } finally {
       if (prevPass === undefined) delete process.env.STUDIO_PASSCODE;
       else process.env.STUDIO_PASSCODE = prevPass;
