@@ -14,6 +14,7 @@ function parseArgs(argv) {
     if (argv[i] === '--episode' && argv[i + 1]) args.episodeId = argv[++i];
     else if (argv[i] === '--channel' && argv[i + 1]) args.channelId = argv[++i];
     else if (argv[i] === '--date' && argv[i + 1]) args.targetDate = argv[++i];
+    else if (argv[i] === '--no-draft') args.createDraft = false;
   }
   return args;
 }
@@ -34,13 +35,26 @@ function loadConnectionConfig() {
   return { cloudUrl, passcode };
 }
 
+function resolveSyncCutDir() {
+  const candidates = [
+    process.env.SYNCCUT_DATA_DIR,
+    'C:\\Users\\iamgr\\Desktop\\SyncCut\\.studio-data',
+    'C:\\Users\\iamgr\\Desktop\\SyncCut\\data',
+  ].filter(Boolean);
+  for (const c of candidates) {
+    const resolved = path.resolve(c);
+    if (fs.existsSync(path.join(resolved, 'studio.sqlite'))) {
+      return resolved;
+    }
+  }
+  return path.resolve('C:\\Users\\iamgr\\Desktop\\SyncCut\\.studio-data');
+}
+
 async function main() {
   const opts = parseArgs(process.argv.slice(2));
   const { cloudUrl, passcode } = loadConnectionConfig();
 
-  const synccutDir = path.resolve(
-    process.env.SYNCCUT_DATA_DIR || 'C:\\Users\\iamgr\\Desktop\\SyncCut\\data'
-  );
+  const synccutDir = resolveSyncCutDir();
   const studioDbPath = path.join(synccutDir, 'studio.sqlite');
   if (!fs.existsSync(studioDbPath)) {
     throw new Error(`SyncCut database not found at ${studioDbPath}`);
@@ -89,6 +103,10 @@ async function main() {
 
   const brief = extractBriefFromSyncCutEpisode(targetEp, bestExp);
   const manifest = {
+    episodeId: targetEp.id,
+    exportId: bestExp.id,
+    version: bestExp.version,
+    shotCount: targetEp.shots?.length ?? 1,
     projectTitle: brief.topic,
     language: brief.language,
     tone: brief.tone,
@@ -113,7 +131,7 @@ async function main() {
 
   const form = new FormData();
   if (opts.channelId) form.append('channelId', opts.channelId);
-  form.append('createDraft', 'true');
+  form.append('createDraft', opts.createDraft === false ? 'false' : 'true');
   if (opts.targetDate) form.append('targetDate', opts.targetDate);
   form.append('manifest', JSON.stringify(manifest));
 
@@ -121,7 +139,7 @@ async function main() {
   form.append(
     'video',
     new Blob([videoBuf], { type: 'video/mp4' }),
-    path.basename(bestExp.file)
+    `${brief.topic || 'synccut_clip'}.mp4`
   );
   if (coverPath) {
     const coverBuf = fs.readFileSync(coverPath);

@@ -103,8 +103,11 @@ export interface MediaAssetSourceMeta {
     sourceApp?: string;
     episodeId?: string;
     exportId?: string;
+    version?: number;
+    shotCount?: number;
     coverTimeSec?: number;
     syntheticMedia?: boolean;
+    brief?: MasterBrief;
 }
 export interface MediaAsset {
     id: string;

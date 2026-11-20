@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { Save } from 'lucide-react';
+import { Download, LogOut, RefreshCw, Save, Upload } from 'lucide-react';
 import {
   CONTENT_FORMATS,
   type AppSettingsPublic,
@@ -33,6 +33,54 @@ export function TemplatesSettingsView({
   const [r2AccessKeyId, setR2AccessKeyId] = useState('');
   const [r2SecretAccessKey, setR2SecretAccessKey] = useState('');
   const [unifiedApiKey, setUnifiedApiKey] = useState('');
+  const [restartingCloud, setRestartingCloud] = useState(false);
+  const [restoringDb, setRestoringDb] = useState(false);
+
+  async function handleRestoreDbFile(file: File) {
+    setRestoringDb(true);
+    try {
+      const buf = await file.arrayBuffer();
+      const bytes = new Uint8Array(buf);
+      let binary = '';
+      for (let i = 0; i < bytes.length; i++) {
+        binary += String.fromCharCode(bytes[i]);
+      }
+      const b64 = btoa(binary);
+      const res = await api.importDatabaseBase64(b64);
+      await onSettingsUpdated();
+      onNotify?.(
+        'success',
+        `ซิงก์ฐานข้อมูลสำเร็จ (${res.imported.channels} ช่อง, ${res.imported.accounts} บัญชี, ${res.imported.rules} ตารางเวลา)`
+      );
+    } catch (err) {
+      onNotify?.('error', err instanceof Error ? err.message : String(err));
+    } finally {
+      setRestoringDb(false);
+    }
+  }
+
+  async function handleRestartCloud() {
+    setRestartingCloud(true);
+    try {
+      await api.restartCloudServer();
+      onNotify?.(
+        'success',
+        'สั่งรีสตาร์ทและดึงเวอร์ชันล่าสุดบน Cloud แล้ว (รอประมาณ 15-20 วินาที)'
+      );
+      setTimeout(() => {
+        setRestartingCloud(false);
+        void onSettingsUpdated();
+      }, 15000);
+    } catch (err) {
+      setRestartingCloud(false);
+      onNotify?.('error', err instanceof Error ? err.message : String(err));
+    }
+  }
+
+  async function handleLogout() {
+    await api.logout().catch(() => {});
+    window.location.reload();
+  }
 
   useEffect(() => {
     void api.listTemplates(channel.id).then((res) => setTemplates(res.templates));
@@ -452,6 +500,76 @@ export function TemplatesSettingsView({
               บันทึกการตั้งค่าระบบ
             </button>
           </div>
+
+          <InsetGroup title="☁️ จัดการระบบ Cloud & สำรองข้อมูลในคลิกเดียว">
+            <InsetRow className="flex flex-wrap items-center justify-between gap-3">
+              <div>
+                <p className="text-[13px] font-semibold text-apple-label">
+                  สำรอง / กู้คืนฐานข้อมูล (SQLite Snapshot)
+                </p>
+                <p className="text-[11.5px] text-apple-secondary">
+                  ดาวน์โหลดไฟล์ฐานข้อมูลเก็บไว้ หรือเลือกไฟล์ .sqlite เพื่อซิงก์ข้อมูลช่องและ Token ขึ้น Cloud ทันที
+                </p>
+              </div>
+              <div className="flex flex-wrap items-center gap-2">
+                <a
+                  href="/api/admin/export-db"
+                  className="apple-btn-secondary text-[12px]"
+                >
+                  <Download className="h-3.5 w-3.5 text-apple-blue" />
+                  ดาวน์โหลด Backup (.sqlite)
+                </a>
+                <label className="apple-btn-secondary cursor-pointer text-[12px]">
+                  <Upload className="h-3.5 w-3.5 text-apple-blue" />
+                  {restoringDb ? 'กำลังซิงก์...' : 'นำเข้าไฟล์ .sqlite'}
+                  <input
+                    type="file"
+                    accept=".sqlite,.db,application/octet-stream"
+                    className="hidden"
+                    disabled={restoringDb}
+                    onChange={(e) => {
+                      const f = e.target.files?.[0];
+                      if (f) void handleRestoreDbFile(f);
+                    }}
+                  />
+                </label>
+              </div>
+            </InsetRow>
+
+            <InsetRow className="flex flex-wrap items-center justify-between gap-3">
+              <div>
+                <p className="text-[13px] font-semibold text-apple-label">
+                  อัปเดต & รีสตาร์ทระบบ Cloud / ล็อกหน้าจอ
+                </p>
+                <p className="text-[11.5px] text-apple-secondary">
+                  สั่งให้เซิร์ฟเวอร์ Cloud ดึงโค้ดรุ่นล่าสุดและรีสตาร์ทตัวเอง หรือออกจากระบบบนอุปกรณ์นี้
+                </p>
+              </div>
+              <div className="flex flex-wrap items-center gap-2">
+                <button
+                  type="button"
+                  disabled={restartingCloud}
+                  onClick={() => void handleRestartCloud()}
+                  className="apple-btn-secondary text-[12px]"
+                >
+                  <RefreshCw
+                    className={`h-3.5 w-3.5 text-apple-blue ${
+                      restartingCloud ? 'animate-spin' : ''
+                    }`}
+                  />
+                  {restartingCloud ? 'กำลังรีสตาร์ท Cloud...' : 'อัปเดต & รีสตาร์ท Cloud'}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => void handleLogout()}
+                  className="apple-btn-secondary text-[12px]"
+                >
+                  <LogOut className="h-3.5 w-3.5 text-apple-red" />
+                  ล็อกหน้าจอ
+                </button>
+              </div>
+            </InsetRow>
+          </InsetGroup>
         </form>
       )}
     </div>

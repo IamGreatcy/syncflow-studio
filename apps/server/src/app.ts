@@ -85,15 +85,18 @@ const LOGIN_PAGE_HTML = `<!doctype html>
   body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;
     font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","Noto Sans Thai",sans-serif;
     background:linear-gradient(160deg,#eef1ff,#f7f7fb 55%,#e9f6ff);color:#1c1c1e}
-  .card{width:min(92vw,380px);background:#fff;border-radius:22px;padding:32px 28px;
+  .card{width:min(92vw,390px);background:#fff;border-radius:22px;padding:32px 28px;
     box-shadow:0 18px 50px rgba(30,40,90,.14)}
   h1{font-size:20px;margin:0 0 4px}
   p{margin:0 0 20px;color:#6b6b73;font-size:13.5px}
-  input{width:100%;padding:13px 14px;font-size:16px;border:1px solid #d9d9e0;border-radius:12px;outline:none}
+  .field{position:relative;display:flex;align-items:center}
+  input{width:100%;padding:13px 64px 13px 14px;font-size:16px;border:1px solid #d9d9e0;border-radius:12px;outline:none}
   input:focus{border-color:#007aff;box-shadow:0 0 0 3px rgba(0,122,255,.15)}
-  button{width:100%;margin-top:14px;padding:13px;font-size:16px;font-weight:600;color:#fff;
+  .toggle{position:absolute;right:8px;padding:6px 10px;font-size:12px;font-weight:600;color:#007aff;
+    background:#eef5ff;border:0;border-radius:8px;cursor:pointer;width:auto;margin:0}
+  button.primary{width:100%;margin-top:14px;padding:13px;font-size:16px;font-weight:600;color:#fff;
     background:#007aff;border:0;border-radius:12px;cursor:pointer}
-  button:disabled{opacity:.6}
+  button.primary:disabled{opacity:.6}
   .err{min-height:20px;margin-top:12px;color:#ff3b30;font-size:13px}
 </style>
 </head>
@@ -101,22 +104,38 @@ const LOGIN_PAGE_HTML = `<!doctype html>
 <form class="card" id="f">
   <h1>SyncFlow Studio</h1>
   <p>กรอกรหัสผ่านครั้งเดียว ระบบจะจำไว้ในอุปกรณ์นี้ 30 วัน</p>
-  <input id="p" name="passcode" type="password" placeholder="รหัสผ่าน" autocomplete="current-password" autofocus />
-  <button id="b" type="submit">เข้าสู่ระบบ</button>
+  <div class="field">
+    <input id="p" name="passcode" type="password" placeholder="รหัสผ่าน" autocomplete="current-password" autofocus />
+    <button class="toggle" id="t" type="button">แสดง</button>
+  </div>
+  <button class="primary" id="b" type="submit">เข้าสู่ระบบ</button>
   <div class="err" id="e"></div>
 </form>
 <script>
-  const f=document.getElementById('f'),p=document.getElementById('p'),b=document.getElementById('b'),e=document.getElementById('e');
-  f.addEventListener('submit',async(ev)=>{
-    ev.preventDefault();e.textContent='';b.disabled=true;
+  const f=document.getElementById('f'),p=document.getElementById('p'),b=document.getElementById('b'),e=document.getElementById('e'),t=document.getElementById('t');
+  t.addEventListener('click',()=>{
+    const show=p.type==='password';
+    p.type=show?'text':'password';
+    t.textContent=show?'ซ่อน':'แสดง';
+  });
+  async function doLogin(val){
+    e.textContent='';b.disabled=true;
     try{
-      const r=await fetch('/api/auth/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({passcode:p.value})});
+      const r=await fetch('/api/auth/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({passcode:val})});
       const d=await r.json().catch(()=>({}));
-      if(r.ok){location.reload();return;}
+      if(r.ok){
+        const u=new URL(location.href);u.searchParams.delete('passcode');u.searchParams.delete('key');
+        location.replace(u.pathname+u.search);
+        return;
+      }
       e.textContent=d.error||'เข้าสู่ระบบไม่สำเร็จ';
     }catch{e.textContent='เชื่อมต่อเซิร์ฟเวอร์ไม่ได้';}
     b.disabled=false;
-  });
+  }
+  f.addEventListener('submit',(ev)=>{ev.preventDefault();doLogin(p.value);});
+  const qs=new URLSearchParams(location.search);
+  const autoKey=qs.get('passcode')||qs.get('key');
+  if(autoKey){p.value=autoKey;doLogin(autoKey);}
 </script>
 </body>
 </html>`;
@@ -343,6 +362,16 @@ export function createApp(params: {
       secure: proto === 'https',
       path: '/',
       maxAge: 60 * 60 * 24 * 30,
+    });
+    return c.json({ ok: true });
+  });
+
+  app.post('/api/auth/logout', (c) => {
+    setCookie(c, SESSION_COOKIE, '', {
+      httpOnly: true,
+      sameSite: 'Lax',
+      path: '/',
+      maxAge: 0,
     });
     return c.json({ ok: true });
   });
@@ -1753,13 +1782,96 @@ export function createApp(params: {
     return c.json(result);
   });
 
-  // ---------- SyncCut Studio Integration ----------
+  // ---------- SyncCut Studio Integration (Local + Cloud Library) ----------
+
+  function buildCloudSyncCutEpisodes(): import('@clipflow/shared').SyncCutEpisodeSummary[] {
+    const assets = db.listMediaAssets();
+    const seen = new Set<string>();
+    const out: import('@clipflow/shared').SyncCutEpisodeSummary[] = [];
+
+    for (const a of assets) {
+      const epId = a.sourceMeta?.episodeId || a.id;
+      if (seen.has(epId)) continue;
+      seen.add(epId);
+
+      const brief = a.sourceMeta?.brief;
+      const cleanName = a.originalFilename
+        .replace(/\.[^.]+$/, '')
+        .replace(/[_-]+/g, ' ')
+        .trim();
+
+      out.push({
+        episodeId: epId,
+        exportId: a.sourceMeta?.exportId || a.id,
+        version: a.sourceMeta?.version ?? null,
+        rawTitle: brief?.topic || cleanName,
+        cleanTitle: brief?.topic || brief?.coverHeadline || cleanName,
+        coverKicker: brief?.coverKicker || '',
+        coverHeadline: brief?.coverHeadline || brief?.topic || cleanName,
+        coverSubline: brief?.coverSubline || '',
+        narrationPreview:
+          brief?.summary ||
+          brief?.transcriptText?.slice(0, 220) ||
+          brief?.hook ||
+          '',
+        aspectRatio:
+          a.orientation === 'VERTICAL'
+            ? '9:16'
+            : a.orientation === 'HORIZONTAL'
+              ? '16:9'
+              : '1:1',
+        durationSec: a.probe.durationSec,
+        width: a.probe.width,
+        height: a.probe.height,
+        shotCount: a.sourceMeta?.shotCount ?? (brief?.keyPoints?.length || 1),
+        hasVideo: true,
+        hasCover: Boolean(
+          a.customCoverKey ||
+            a.customCoverPublicUrl ||
+            a.thumbnailPaths.length > 0
+        ),
+        coverTimeSec: a.sourceMeta?.coverTimeSec ?? 0,
+        updatedAt: a.createdAt,
+      });
+    }
+    return out;
+  }
+
+  function findMediaAssetForSyncCutEpisode(episodeId: string, exportId?: string) {
+    const assets = db.listMediaAssets();
+    return (
+      assets.find(
+        (a) =>
+          (exportId && (a.sourceMeta?.exportId === exportId || a.id === exportId)) ||
+          a.sourceMeta?.episodeId === episodeId ||
+          a.id === episodeId
+      ) ?? null
+    );
+  }
 
   app.get('/api/integrations/synccut/episodes', (c) => {
     const settings = db.getSettingsFull();
     try {
-      const data = listSyncCutEpisodes(settings.synccutDataDir);
-      return c.json(data);
+      const localData = listSyncCutEpisodes(settings.synccutDataDir);
+      const cloudEpisodes = buildCloudSyncCutEpisodes();
+      const mergedMap = new Map<string, import('@clipflow/shared').SyncCutEpisodeSummary>();
+      for (const ep of localData.episodes) {
+        mergedMap.set(ep.episodeId, ep);
+      }
+      for (const ep of cloudEpisodes) {
+        if (!mergedMap.has(ep.episodeId)) {
+          mergedMap.set(ep.episodeId, ep);
+        }
+      }
+      const episodes = Array.from(mergedMap.values());
+      const connected = localData.connected || episodes.length > 0;
+      return c.json({
+        connected,
+        dataDir: localData.connected
+          ? localData.dataDir
+          : 'Cloudflare R2 + SyncCut Cloud Library',
+        episodes,
+      });
     } catch (err) {
       return c.json(
         { error: err instanceof Error ? err.message : String(err) },
@@ -1777,18 +1889,53 @@ export function createApp(params: {
       episodeId,
       exportId || undefined
     );
-    if (!coverPath) {
-      return c.json({ error: 'SyncCut cover not found' }, 404);
+    if (coverPath && fs.existsSync(coverPath)) {
+      const buf = await fs.promises.readFile(coverPath);
+      const ext = path.extname(coverPath).toLowerCase();
+      return new Response(buf, {
+        status: 200,
+        headers: {
+          'Content-Type': ext === '.jpg' || ext === '.jpeg' ? 'image/jpeg' : 'image/png',
+          'Cache-Control': 'public, max-age=300',
+        },
+      });
     }
-    const buf = await fs.promises.readFile(coverPath);
-    const ext = path.extname(coverPath).toLowerCase();
-    return new Response(buf, {
-      status: 200,
-      headers: {
-        'Content-Type': ext === '.jpg' || ext === '.jpeg' ? 'image/jpeg' : 'image/png',
-        'Cache-Control': 'public, max-age=300',
-      },
-    });
+
+    const asset = findMediaAssetForSyncCutEpisode(episodeId, exportId || undefined);
+    if (asset) {
+      const ensuredCover = await storage.ensureCustomCover(asset.id, settings);
+      if (ensuredCover && fs.existsSync(ensuredCover)) {
+        const buf = await fs.promises.readFile(ensuredCover);
+        return new Response(buf, {
+          status: 200,
+          headers: {
+            'Content-Type': 'image/jpeg',
+            'Cache-Control': 'public, max-age=300',
+          },
+        });
+      }
+      if (asset.thumbnailPaths.length > 0) {
+        const thumbPath = path.join(
+          storage.resolveThumbnailDir(asset.id),
+          asset.thumbnailPaths[0]
+        );
+        if (fs.existsSync(thumbPath)) {
+          const buf = await fs.promises.readFile(thumbPath);
+          return new Response(buf, {
+            status: 200,
+            headers: {
+              'Content-Type': 'image/jpeg',
+              'Cache-Control': 'public, max-age=300',
+            },
+          });
+        }
+      }
+      if (asset.customCoverPublicUrl) {
+        return c.redirect(asset.customCoverPublicUrl, 302);
+      }
+    }
+
+    return c.json({ error: 'SyncCut cover not found' }, 404);
   });
 
   app.post('/api/integrations/synccut/import-episode', async (c) => {
@@ -1804,15 +1951,87 @@ export function createApp(params: {
     }
     const settings = db.getSettingsFull();
     try {
-      const result = await importSyncCutEpisode({
-        db,
-        storage,
-        dataDir: settings.synccutDataDir,
-        channelId: parsed.data.channelId,
-        episodeId: parsed.data.episodeId,
-        exportId: parsed.data.exportId,
+      const hasLocalStudioDb = Boolean(
+        settings.synccutDataDir &&
+          fs.existsSync(path.join(settings.synccutDataDir, 'studio.sqlite'))
+      );
+      if (hasLocalStudioDb) {
+        const result = await importSyncCutEpisode({
+          db,
+          storage,
+          dataDir: settings.synccutDataDir,
+          channelId: parsed.data.channelId,
+          episodeId: parsed.data.episodeId,
+          exportId: parsed.data.exportId,
+        });
+        return c.json(result, 201);
+      }
+
+      const asset = findMediaAssetForSyncCutEpisode(
+        parsed.data.episodeId,
+        parsed.data.exportId
+      );
+      if (!asset) {
+        throw new Error('ไม่พบคลิปนี้ในคลัง SyncCut Cloud');
+      }
+
+      await storage.ensureCustomCover(asset.id, settings).catch(() => null);
+      const detection = detectRecommendedFormats(asset.probe);
+      const cleanTitle = asset.originalFilename
+        .replace(/\.[^.]+$/, '')
+        .replace(/[_-]+/g, ' ')
+        .trim();
+
+      const brief: MasterBrief = asset.sourceMeta?.brief ?? {
+        topic: cleanTitle || 'คลิปจาก SyncCut Studio',
+        hook: cleanTitle || 'คลิปจาก SyncCut Studio',
+        summary: cleanTitle || 'คลิปจาก SyncCut Studio',
+        keyPoints: [],
+        cta: 'กดติดตามไว้ไม่พลาดคลิปใหม่!',
+        coreHashtags: [],
+        language: 'th',
+        tone: 'FRIENDLY',
+        isSyntheticMedia: Boolean(asset.sourceMeta?.syntheticMedia ?? true),
+        coverTimestampMs: Math.round((asset.sourceMeta?.coverTimeSec ?? 0) * 1000),
+      };
+
+      const templates = db.listTemplates(parsed.data.channelId);
+      const gen = await generateMetadataWithAI({
+        brief,
+        formats: detection.recommendedFormats,
+        templates,
+        probe: asset.probe,
+        settings,
       });
-      return c.json(result, 201);
+
+      const warningsByFormat: Record<string, ValidationIssue[]> = {};
+      for (const fmt of CONTENT_FORMATS) {
+        warningsByFormat[fmt] = validateVideoCompatibility(fmt, asset.probe);
+      }
+      const issues: ValidationIssue[] = [];
+      for (const fmt of detection.recommendedFormats) {
+        issues.push(
+          ...validateFormatMetadata(
+            fmt,
+            gen.metadata[fmt] as Record<string, unknown> | undefined,
+            asset.probe
+          )
+        );
+      }
+
+      return c.json(
+        {
+          asset,
+          brief,
+          metadata: gen.metadata,
+          engineUsed: gen.engineUsed,
+          warning: gen.warning,
+          detection,
+          warningsByFormat,
+          issues,
+        },
+        201
+      );
     } catch (err) {
       return c.json(
         { error: err instanceof Error ? err.message : String(err) },
@@ -1953,6 +2172,10 @@ export function createApp(params: {
 
       const manifest = parsedUpload.manifestRaw
         ? (JSON.parse(parsedUpload.manifestRaw) as {
+            episodeId?: string;
+            exportId?: string;
+            version?: number;
+            shotCount?: number;
             projectTitle?: string;
             language?: 'th' | 'en' | 'bilingual';
             tone?: MasterBrief['tone'];
@@ -2025,8 +2248,13 @@ export function createApp(params: {
         customCoverPublicUrl,
         sourceMeta: {
           sourceApp: 'SyncCut Studio',
+          episodeId: manifest.episodeId || assetId,
+          exportId: manifest.exportId || assetId,
+          version: manifest.version,
+          shotCount: manifest.shotCount,
           syntheticMedia: true,
           coverTimeSec: (manifest.cover?.timestampMs ?? 0) / 1000,
+          brief,
         },
         mimeType: parsedUpload.mimeType,
         fileSizeBytes: parsedUpload.videoSaved.sizeBytes,
@@ -2146,7 +2374,29 @@ export function createApp(params: {
     return c.json({ settings: updated });
   });
 
-  // ---------- Cloud DB Import Endpoint ----------
+  // ---------- Cloud DB Import & Export Endpoints ----------
+
+  app.get('/api/admin/export-db', async (c) => {
+    const tmpSnapPath = path.join(
+      os.tmpdir(),
+      `syncflow_export_${randomUUID()}.sqlite`
+    );
+    try {
+      const escaped = tmpSnapPath.replace(/'/g, "''");
+      db.sqlite.exec(`VACUUM INTO '${escaped}';`);
+      const buf = await fs.promises.readFile(tmpSnapPath);
+      const dateStr = new Date().toISOString().slice(0, 10);
+      return new Response(buf, {
+        status: 200,
+        headers: {
+          'Content-Type': 'application/octet-stream',
+          'Content-Disposition': `attachment; filename="syncflow-backup-${dateStr}.sqlite"`,
+        },
+      });
+    } finally {
+      await fs.promises.unlink(tmpSnapPath).catch(() => {});
+    }
+  });
 
   app.post('/api/admin/import-db', async (c) => {
     const passcode = process.env.STUDIO_PASSCODE?.trim();

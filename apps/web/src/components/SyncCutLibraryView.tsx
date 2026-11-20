@@ -3,8 +3,10 @@ import {
   Clapperboard,
   FolderOpen,
   Image as ImageIcon,
+  ImagePlus,
   RefreshCw,
   Sparkles,
+  Upload,
 } from 'lucide-react';
 import type {
   SyncCutEpisodeSummary,
@@ -39,8 +41,43 @@ export function SyncCutLibraryView({
   const [importingId, setImportingId] = useState<string | null>(null);
   const [refreshing, setRefreshing] = useState(false);
 
+  // All-in-one browser upload (video + cover + topic -> AI metadata -> Planner Step 3)
+  const [quickVideo, setQuickVideo] = useState<File | null>(null);
+  const [quickCover, setQuickCover] = useState<File | null>(null);
+  const [quickTopic, setQuickTopic] = useState('');
+  const [quickUploadingPct, setQuickUploadingPct] = useState<number | null>(null);
+
   const readyEpisodes = episodes.filter((e) => e.hasVideo);
   const pendingEpisodes = episodes.filter((e) => !e.hasVideo);
+
+  async function handleQuickBundleUpload() {
+    if (!quickVideo) {
+      onNotify?.('error', 'กรุณาเลือกไฟล์วิดีโอ (.mp4) ก่อน');
+      return;
+    }
+    setQuickUploadingPct(0);
+    try {
+      const res = await api.uploadSyncCutBundleWithProgress(
+        {
+          channelId: channel.id,
+          video: quickVideo,
+          cover: quickCover,
+          topic: quickTopic,
+          createDraft: false,
+        },
+        setQuickUploadingPct
+      );
+      setQuickVideo(null);
+      setQuickCover(null);
+      setQuickTopic('');
+      setQuickUploadingPct(null);
+      await onRefresh();
+      onImported(res, targetDate);
+    } catch (err) {
+      setQuickUploadingPct(null);
+      onNotify?.('error', err instanceof Error ? err.message : String(err));
+    }
+  }
 
   async function handleRefresh() {
     setRefreshing(true);
@@ -136,6 +173,83 @@ export function SyncCutLibraryView({
           <FolderOpen className="h-3.5 w-3.5" />
           ตั้งค่าโฟลเดอร์ SyncCut
         </button>
+      </div>
+
+      {/* All-in-One Quick Upload & AI Generator right inside SyncFlow Studio */}
+      <div className="apple-card space-y-3 p-4">
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <div>
+            <h3 className="apple-headline text-[14.5px] text-apple-label">
+              ⚡ นำเข้าคลิป + หน้าปกด่วนในคลิกเดียว (จบในหน้าเว็บ)
+            </h3>
+            <p className="text-[12px] text-apple-secondary">
+              เลือกไฟล์วิดีโอ (.mp4) และภาพหน้าปก (.png/.jpg) จากเครื่อง ระบบจะอัปโหลดขึ้น Cloud สร้างชื่อและคำอธิบาย AI ทั้ง 4 แพลตฟอร์ม และพาไปหน้าพร้อมลงทันที
+            </p>
+          </div>
+        </div>
+
+        <div className="grid grid-cols-1 gap-3 md:grid-cols-12">
+          <label
+            className="flex cursor-pointer items-center gap-2.5 rounded-[12px] border bg-apple-grouped/50 px-3 py-2.5 text-[12.5px] md:col-span-4"
+            style={{ borderColor: quickVideo ? 'var(--apple-green)' : 'var(--separator)' }}
+          >
+            <Upload className="h-4 w-4 shrink-0 text-apple-blue" />
+            <span className="truncate font-medium text-apple-label">
+              {quickVideo ? quickVideo.name : '1. เลือกไฟล์วิดีโอ (.mp4)'}
+            </span>
+            <input
+              type="file"
+              accept="video/mp4,video/quicktime,video/*"
+              className="hidden"
+              onChange={(e) => {
+                const f = e.target.files?.[0] ?? null;
+                setQuickVideo(f);
+                if (f && !quickTopic) {
+                  setQuickTopic(
+                    f.name.replace(/\.[^.]+$/, '').replace(/[_-]+/g, ' ').trim()
+                  );
+                }
+              }}
+            />
+          </label>
+
+          <label
+            className="flex cursor-pointer items-center gap-2.5 rounded-[12px] border bg-apple-grouped/50 px-3 py-2.5 text-[12.5px] md:col-span-3"
+            style={{ borderColor: quickCover ? 'var(--apple-green)' : 'var(--separator)' }}
+          >
+            <ImagePlus className="h-4 w-4 shrink-0 text-apple-blue" />
+            <span className="truncate font-medium text-apple-label">
+              {quickCover ? quickCover.name : '2. ภาพหน้าปก (ถ้ามี)'}
+            </span>
+            <input
+              type="file"
+              accept="image/*"
+              className="hidden"
+              onChange={(e) => setQuickCover(e.target.files?.[0] ?? null)}
+            />
+          </label>
+
+          <input
+            value={quickTopic}
+            onChange={(e) => setQuickTopic(e.target.value)}
+            placeholder="3. หัวข้อคลิป / ประเด็นหลัก (ให้ AI เขียนแคปชั่น)"
+            className="apple-input text-[12.5px] md:col-span-5"
+          />
+        </div>
+
+        <div className="flex justify-end">
+          <button
+            type="button"
+            disabled={!quickVideo || quickUploadingPct !== null}
+            onClick={() => void handleQuickBundleUpload()}
+            className="apple-btn-primary"
+          >
+            <Sparkles className="h-4 w-4" />
+            {quickUploadingPct !== null
+              ? `กำลังอัปโหลด & สร้างคำอธิบาย AI (${quickUploadingPct}%)...`
+              : 'นำเข้า & สร้างคำอธิบาย AI ทั้ง 4 แพลตฟอร์มทันที →'}
+          </button>
+        </div>
       </div>
 
       {!connected ? (

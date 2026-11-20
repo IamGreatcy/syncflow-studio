@@ -855,6 +855,18 @@ export function ContentPlannerModal({
                         {optimizing ? 'กำลัง Optimize...' : 'Optimize (FFmpeg)'}
                       </button>
                     </div>
+
+                    <button
+                      type="button"
+                      onClick={() => void handleGenerateMetadata(true)}
+                      disabled={generating || enabledFormats.length === 0}
+                      className="apple-btn-primary w-full justify-center py-2.5 text-[13px]"
+                    >
+                      <Sparkles className="h-4 w-4" />
+                      {generating
+                        ? 'กำลังสร้างชื่อและคำอธิบาย AI...'
+                        : 'สร้างคำอธิบาย AI ทั้ง 4 แพลตฟอร์ม & ไปหน้าพร้อมลงทันที →'}
+                    </button>
                   </div>
                 )}
               </div>

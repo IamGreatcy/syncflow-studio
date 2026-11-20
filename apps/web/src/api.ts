@@ -341,6 +341,74 @@ export const api = {
       body: JSON.stringify(payload),
     }),
 
+  uploadSyncCutBundleWithProgress: (
+    params: {
+      channelId: string;
+      video: File;
+      cover?: File | null;
+      topic?: string;
+      hook?: string;
+      summary?: string;
+      createDraft?: boolean;
+    },
+    onProgress?: (pct: number) => void
+  ): Promise<SyncCutImportResponse> => {
+    return new Promise((resolve, reject) => {
+      const cleanName = params.video.name
+        .replace(/\.[^.]+$/, '')
+        .replace(/[_-]+/g, ' ')
+        .trim();
+      const topic = params.topic?.trim() || cleanName || 'คลิปใหม่ล่าสุด';
+      const hook = params.hook?.trim() || topic;
+      const summary = params.summary?.trim() || topic;
+
+      const manifest = {
+        projectTitle: topic,
+        language: 'th',
+        tone: 'FRIENDLY',
+        content: {
+          topic,
+          hook,
+          summary,
+        },
+        cover: {
+          headline: topic,
+        },
+      };
+
+      const form = new FormData();
+      form.append('channelId', params.channelId);
+      form.append('createDraft', params.createDraft ? 'true' : 'false');
+      form.append('manifest', JSON.stringify(manifest));
+      form.append('video', params.video);
+      if (params.cover) {
+        form.append('cover', params.cover);
+      }
+
+      const xhr = new XMLHttpRequest();
+      xhr.open('POST', '/api/integrations/synccut/import');
+      xhr.upload.onprogress = (ev) => {
+        if (ev.lengthComputable && onProgress) {
+          onProgress(Math.round((ev.loaded / ev.total) * 100));
+        }
+      };
+      xhr.onload = () => {
+        try {
+          const parsed = JSON.parse(xhr.responseText);
+          if (xhr.status >= 200 && xhr.status < 300) {
+            resolve(parsed as SyncCutImportResponse);
+          } else {
+            reject(new Error(parsed.error || `Import failed (${xhr.status})`));
+          }
+        } catch {
+          reject(new Error(`Import failed (${xhr.status})`));
+        }
+      };
+      xhr.onerror = () => reject(new Error('Network error while uploading bundle'));
+      xhr.send(form);
+    });
+  },
+
   createContent: (payload: {
     channelId: string;
     mediaAssetId: string;
@@ -404,5 +472,32 @@ export const api = {
     req<{ settings: AppSettingsPublic }>('/api/settings', {
       method: 'PUT',
       body: JSON.stringify(payload),
+    }),
+
+  importDatabaseBase64: (sqliteBase64: string) =>
+    req<{
+      ok: boolean;
+      imported: {
+        channels: number;
+        accounts: number;
+        rules: number;
+        templates: number;
+        assets: number;
+        contents: number;
+        jobs: number;
+      };
+    }>('/api/admin/import-db', {
+      method: 'POST',
+      body: JSON.stringify({ sqliteBase64 }),
+    }),
+
+  restartCloudServer: () =>
+    req<{ ok: boolean; message: string }>('/api/admin/restart', {
+      method: 'POST',
+    }),
+
+  logout: () =>
+    req<{ ok: boolean }>('/api/auth/logout', {
+      method: 'POST',
     }),
 };
