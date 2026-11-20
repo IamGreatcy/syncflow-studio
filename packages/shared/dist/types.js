@@ -1,0 +1,24 @@
+export const PLATFORMS = ['YOUTUBE', 'TIKTOK', 'INSTAGRAM', 'FACEBOOK'];
+export const CONTENT_FORMATS = [
+    'YOUTUBE_SHORTS',
+    'YOUTUBE_LONG',
+    'TIKTOK',
+    'INSTAGRAM_REELS',
+    'FACEBOOK_REELS',
+    'FACEBOOK_VIDEO',
+];
+export const CONNECTION_MODES = ['SIMULATION', 'LIVE_OFFICIAL', 'UNIFIED_API'];
+export const PUBLISH_STRATEGIES = ['NATIVE_PREUPLOAD', 'JIT_PUBLISH', 'INBOX_DRAFT'];
+export const JOB_STATUSES = [
+    'DRAFT',
+    'QUEUED',
+    'PREUPLOADING',
+    'NATIVE_SCHEDULED',
+    'PREWARMING',
+    'READY_TO_PUBLISH',
+    'PUBLISHING',
+    'PUBLISHED',
+    'FAILED',
+    'CANCELLED',
+];
+//# sourceMappingURL=types.js.map
