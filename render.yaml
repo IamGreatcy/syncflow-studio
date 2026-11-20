@@ -1,0 +1,20 @@
+services:
+  - type: web
+    name: syncflow-studio
+    runtime: docker
+    plan: starter
+    region: singapore
+    healthCheckPath: /api/health
+    disk:
+      name: syncflow-data
+      mountPath: /app/data
+      sizeGB: 2
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: HOST
+        value: 0.0.0.0
+      - key: DATA_DIR
+        value: /app/data
+      - key: STUDIO_PASSCODE
+        generateValue: true

@@ -1,0 +1,29 @@
+{
+  "name": "syncflow-studio",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Multi-platform video scheduler, hybrid pre-upload dispatcher, and platform-tailored metadata studio",
+  "workspaces": [
+    "packages/shared",
+    "apps/server",
+    "apps/web"
+  ],
+  "scripts": {
+    "dev": "npm run build --workspace=@clipflow/shared && concurrently -n api,web -c cyan,magenta \"npm run dev --workspace=@clipflow/server\" \"npm run dev --workspace=@clipflow/web\"",
+    "build": "npm run build --workspace=@clipflow/shared && npm run build --workspace=@clipflow/server && npm run build --workspace=@clipflow/web",
+    "typecheck": "npm run typecheck --workspace=@clipflow/shared && npm run typecheck --workspace=@clipflow/server && npm run typecheck --workspace=@clipflow/web",
+    "test": "npm run build --workspace=@clipflow/shared && npx tsx --test packages/shared/test/*.test.ts apps/server/test/*.test.ts",
+    "start": "npm run start --workspace=@clipflow/server",
+    "cloud:prepare": "node scripts/prepare-cloud-data.mjs",
+    "cloud:sync-db": "node scripts/sync-cloud-db.mjs",
+    "cloud:push-synccut": "node scripts/push-synccut-to-cloud.mjs"
+  },
+  "overrides": {
+    "rollup": "npm:@rollup/wasm-node@^4.35.0"
+  },
+  "devDependencies": {
+    "concurrently": "^9.1.2",
+    "typescript": "^5.8.2"
+  }
+}

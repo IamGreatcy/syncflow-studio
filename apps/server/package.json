@@ -1,0 +1,26 @@
+{
+  "name": "@clipflow/server",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "start": "node dist/index.js"
+  },
+  "dependencies": {
+    "@aws-sdk/client-s3": "^3.777.0",
+    "@aws-sdk/lib-storage": "^3.777.0",
+    "@clipflow/shared": "*",
+    "@hono/node-server": "^1.14.0",
+    "busboy": "^1.6.0",
+    "dotenv": "^16.4.7",
+    "hono": "^4.7.5",
+    "zod": "^3.24.2"
+  },
+  "devDependencies": {
+    "@types/busboy": "^1.5.4",
+    "@types/node": "^22.13.10",
+    "tsx": "^4.19.3"
+  }
+}

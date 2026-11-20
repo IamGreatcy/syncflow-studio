@@ -1,0 +1,12 @@
+node_modules/
+dist/
+data/
+cloud-bundle/
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+.env
+.env.local
+.DS_Store
+Thumbs.db
+tmp/
