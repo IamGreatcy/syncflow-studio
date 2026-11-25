@@ -304,10 +304,21 @@ export function generateMetadataDeterministic(params) {
     const coverMs = Math.max(0, Number(brief.coverTimestampMs ?? 0));
     const isSynthetic = Boolean(brief.isSyntheticMedia);
     const result = {};
+    const GENERIC_SEEDED_CTAS = new Set([
+        'กดติดตามไว้ไม่พลาดคลิปใหม่!',
+        'คิดเห็นยังไง คอมเมนต์คุยกันและฝากกด Subscribe ด้วยนะครับ',
+        'เคยสงสัยไหม? คอมเมนต์หรือ Save เก็บไว้เลย 👇',
+        'กด Save หรือส่งต่อให้เพื่อนได้เลย!',
+        'คิดเห็นยังไง คอมเมนต์คุยกันได้เลยครับ!',
+        'เห็นด้วยไหมครับ? คอมเมนต์แลกเปลี่ยนมุมมองกันได้เลย หรือแชร์ต่อให้คนใกล้ตัว!',
+    ]);
     for (const format of formats) {
         const tpl = tplMap.get(format);
+        const customTemplateCta = tpl?.defaultCta && !GENERIC_SEEDED_CTAS.has(tpl.defaultCta.trim())
+            ? tpl.defaultCta.trim()
+            : '';
         const cta = briefCta ||
-            tpl?.defaultCta ||
+            customTemplateCta ||
             pickContextualEngagementCta(topic, format, brief.language);
         const ytCategoryId = inferYouTubeCategoryId(brief, tpl);
         if (format === 'YOUTUBE_SHORTS') {
@@ -633,15 +644,29 @@ Return ONLY a valid raw JSON object containing the exact requested keys from [${
                 .split(/[\r\n,]+/)
                 .map((k) => k.trim())
                 .filter(Boolean);
-            const preferredModel = settings.aiModel?.trim() || 'gemini-3.8-flash';
+            const preferredRaw = settings.aiModel?.trim() || '';
+            const retiredOrPhantom = /^(?:gemini-2\.5-|gemini-3\.[67]-|gemini-3\.1-flash-lite$)/i;
+            const preferredModel = preferredRaw && !retiredOrPhantom.test(preferredRaw) ? preferredRaw : '';
             const candidateModels = dedupeStrings([
                 preferredModel,
+                'gemini-3.5-flash-lite',
                 'gemini-3.8-flash',
-                'gemini-3.6-flash',
                 'gemini-3.5-flash',
-                'gemini-3.1-flash-lite',
-                'gemini-flash-lite-latest',
+                'gemini-3-flash-preview',
+                'gemini-3.1-flash-lite-preview',
             ]);
+            const thinkingForModel = (modelName) => {
+                if (/^gemini-3(?:\.\d+)?-flash-lite/i.test(modelName)) {
+                    return { thinkingConfig: { thinkingLevel: 'MINIMAL' } };
+                }
+                if (/^gemini-3(?:\.\d+)?-/i.test(modelName)) {
+                    return { thinkingConfig: { thinkingLevel: 'LOW' } };
+                }
+                if (/^gemini-2\.5-flash/i.test(modelName)) {
+                    return { thinkingConfig: { thinkingBudget: 0 } };
+                }
+                return {};
+            };
             let lastErr = null;
             outer: for (const model of candidateModels) {
                 for (const key of apiKeys) {
@@ -649,27 +674,35 @@ Return ONLY a valid raw JSON object containing the exact requested keys from [${
                         const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(key)}`;
                         const res = await fetch(url, {
                             method: 'POST',
-                            signal: AbortSignal.timeout(12_000),
+                            signal: AbortSignal.timeout(20_000),
                             headers: { 'Content-Type': 'application/json' },
                             body: JSON.stringify({
                                 contents: [{ parts: [{ text: prompt }] }],
                                 generationConfig: {
                                     responseMimeType: 'application/json',
-                                    temperature: 0.7,
+                                    temperature: 0.45,
+                                    ...thinkingForModel(model),
                                 },
                             }),
                         });
                         if (res.ok) {
                             const data = (await res.json());
-                            rawText = data.candidates?.[0]?.content?.parts?.[0]?.text ?? '';
+                            rawText =
+                                data.candidates?.[0]?.content?.parts
+                                    ?.filter((p) => p && !p.thought && typeof p.text === 'string')
+                                    .map((p) => p.text)
+                                    .join('') ?? '';
                             if (rawText)
                                 break outer;
                         }
                         else {
                             const errBody = await res.text();
                             lastErr = new Error(`Gemini HTTP ${res.status} (${model}): ${errBody}`);
-                            // Model-level errors (overloaded/deprecated/timeout) won't be fixed by rotating keys -> skip straight to next model
-                            if (res.status === 404 || res.status === 503) {
+                            if (res.status === 400 && /API key/i.test(errBody)) {
+                                continue;
+                            }
+                            // Model-level errors (overloaded/deprecated/unsupported) won't be fixed by rotating keys -> skip straight to next model
+                            if (res.status === 400 || res.status === 404 || res.status === 503 || res.status >= 500) {
                                 continue outer;
                             }
                         }

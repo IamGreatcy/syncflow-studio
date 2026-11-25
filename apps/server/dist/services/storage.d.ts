@@ -60,5 +60,15 @@ export declare class StorageService {
         settings: AppSettingsFull;
     }): Promise<SavedObjectResult>;
     deleteFile(storageKey: string, settings: AppSettingsFull): Promise<void>;
+    deleteMediaAssetFiles(asset: {
+        id: string;
+        storageKey: string;
+        optimizedStorageKey?: string | null;
+    }, settings: AppSettingsFull): Promise<void>;
+    pruneOldCoverCache(maxAgeDays?: number): Promise<number>;
+    backupDatabaseToR2(writeBackup: (destPath: string) => void, settings: AppSettingsFull, keepDays?: number): Promise<{
+        uploadedKey: string | null;
+        prunedBackups: number;
+    }>;
 }
 //# sourceMappingURL=storage.d.ts.map

@@ -221,17 +221,11 @@ export class YouTubeAdapter {
                 const buf = Buffer.alloc(length);
                 await handle.read(buf, 0, length, offset);
                 const end = offset + length - 1;
-                const res = await fetch(uploadUrl, {
-                    method: 'PUT',
-                    headers: {
-                        'Content-Type': mimeType,
-                        'Content-Length': String(length),
-                        'Content-Range': `bytes ${offset}-${end}/${totalSize}`,
-                    },
-                    body: buf,
-                });
+                const res = await this.uploadChunkWithResume(uploadUrl, buf, offset, end, totalSize, mimeType);
                 if (res.status === 308) {
-                    offset += length;
+                    const rangeHeader = res.headers.get('range');
+                    const m = rangeHeader ? /bytes=0-(\d+)/i.exec(rangeHeader) : null;
+                    offset = m ? Number(m[1]) + 1 : offset + length;
                     continue;
                 }
                 if (res.ok) {
@@ -248,8 +242,82 @@ export class YouTubeAdapter {
             await handle.close();
         }
     }
+    async uploadChunkWithResume(uploadUrl, buf, offset, end, totalSize, mimeType) {
+        let lastErr;
+        for (let attempt = 0; attempt < 3; attempt++) {
+            try {
+                const res = await fetch(uploadUrl, {
+                    method: 'PUT',
+                    signal: AbortSignal.timeout(90_000),
+                    headers: {
+                        'Content-Type': mimeType,
+                        'Content-Length': String(buf.length),
+                        'Content-Range': `bytes ${offset}-${end}/${totalSize}`,
+                    },
+                    body: buf,
+                });
+                if (res.status === 308 || res.ok || (res.status < 500 && res.status !== 408 && res.status !== 429)) {
+                    return res;
+                }
+                lastErr = new Error(`YouTube chunk upload HTTP ${res.status}`);
+            }
+            catch (err) {
+                lastErr = err;
+            }
+            if (attempt < 2) {
+                await new Promise((r) => setTimeout(r, (attempt + 1) * 1500));
+                // Probe server upload offset before resending so we never double-send confirmed chunks
+                try {
+                    const probe = await fetch(uploadUrl, {
+                        method: 'PUT',
+                        signal: AbortSignal.timeout(15_000),
+                        headers: {
+                            'Content-Length': '0',
+                            'Content-Range': `bytes */${totalSize}`,
+                        },
+                    });
+                    if (probe.status === 308 || probe.ok) {
+                        return probe;
+                    }
+                }
+                catch {
+                    // retry full chunk
+                }
+            }
+        }
+        throw lastErr instanceof Error ? lastErr : new Error(String(lastErr));
+    }
     async publishNow(ctx) {
         if (ctx.job.status === 'NATIVE_SCHEDULED' && ctx.job.externalPostId) {
+            if (ctx.account.connectionMode === 'LIVE_OFFICIAL' && ctx.accessToken) {
+                try {
+                    const stRes = await fetch(`https://www.googleapis.com/youtube/v3/videos?part=status&id=${encodeURIComponent(ctx.job.externalPostId)}`, {
+                        headers: { Authorization: `Bearer ${ctx.accessToken}` },
+                        signal: AbortSignal.timeout(10_000),
+                    });
+                    if (stRes.ok) {
+                        const stData = (await stRes.json());
+                        const item = stData.items?.[0]?.status;
+                        if (!item) {
+                            throw new Error(`ไม่พบวิดีโอ YouTube ${ctx.job.externalPostId} (อาจถูกลบไปแล้วบน YouTube Studio)`);
+                        }
+                        if (item.uploadStatus === 'failed' || item.uploadStatus === 'rejected') {
+                            throw new Error(`YouTube ปฏิเสธวิดีโอ (${item.uploadStatus}: ${item.rejectionReason || item.failureReason || 'unknown'})`);
+                        }
+                        ctx.log('INFO', 'YT_NATIVE_VERIFY', `ยืนยันสถานะ YouTube จริงแล้ว (uploadStatus=${item.uploadStatus ?? 'ok'}, privacy=${item.privacyStatus ?? 'unknown'})`, { externalPostId: ctx.job.externalPostId, status: item });
+                        return {
+                            externalPostId: ctx.job.externalPostId,
+                            externalUrl: ctx.job.externalUrl,
+                        };
+                    }
+                }
+                catch (err) {
+                    if (err instanceof Error && /ไม่พบวิดีโอ YouTube|YouTube ปฏิเสธวิดีโอ/.test(err.message)) {
+                        throw err;
+                    }
+                    // Transient API error — fall through and preserve verified native schedule
+                }
+            }
             ctx.log('INFO', 'YT_NATIVE_VERIFY', 'คลิปถูก Pre-upload พร้อม publishAt บน YouTube แล้ว — ยืนยันสถานะเผยแพร่', { externalPostId: ctx.job.externalPostId });
             return {
                 externalPostId: ctx.job.externalPostId,

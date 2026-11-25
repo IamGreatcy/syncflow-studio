@@ -5,7 +5,12 @@ import { createHash } from 'node:crypto';
 import { pipeline } from 'node:stream/promises';
 import type { Readable } from 'node:stream';
 import type { MediaProbeInfo } from '@clipflow/shared';
-import { S3Client, DeleteObjectCommand, GetObjectCommand } from '@aws-sdk/client-s3';
+import {
+  S3Client,
+  DeleteObjectCommand,
+  GetObjectCommand,
+  ListObjectsV2Command,
+} from '@aws-sdk/client-s3';
 import { Upload } from '@aws-sdk/lib-storage';
 import { NodeHttpHandler } from '@smithy/node-http-handler';
 import type { AppSettingsFull } from '../db/database.js';
@@ -310,6 +315,101 @@ export class StorageService {
           })
         )
         .catch(() => {});
+    }
+  }
+
+  async deleteMediaAssetFiles(
+    asset: { id: string; storageKey: string; optimizedStorageKey?: string | null },
+    settings: AppSettingsFull
+  ): Promise<void> {
+    if (asset.storageKey) {
+      await this.deleteFile(asset.storageKey, settings);
+    }
+    if (asset.optimizedStorageKey && asset.optimizedStorageKey !== asset.storageKey) {
+      await this.deleteFile(asset.optimizedStorageKey, settings);
+    }
+    await this.deleteFile(`covers/${asset.id}_cover.jpg`, settings);
+    const thumbDir = path.join(this.thumbnailsDir, asset.id);
+    if (fs.existsSync(thumbDir)) {
+      await fs.promises.rm(thumbDir, { recursive: true, force: true }).catch(() => {});
+    }
+  }
+
+  async pruneOldCoverCache(maxAgeDays = 7): Promise<number> {
+    const cacheDir = path.join(this.uploadsDir, '_cover_cache');
+    if (!fs.existsSync(cacheDir)) return 0;
+    const cutoff = Date.now() - Math.max(1, maxAgeDays) * 24 * 60 * 60_000;
+    let removed = 0;
+    for (const entry of await fs.promises.readdir(cacheDir, { withFileTypes: true })) {
+      if (!entry.isFile()) continue;
+      const full = path.join(cacheDir, entry.name);
+      try {
+        const st = await fs.promises.stat(full);
+        if (st.mtimeMs < cutoff) {
+          await fs.promises.unlink(full);
+          removed++;
+        }
+      } catch {
+        // ignore
+      }
+    }
+    return removed;
+  }
+
+  async backupDatabaseToR2(
+    writeBackup: (destPath: string) => void,
+    settings: AppSettingsFull,
+    keepDays = 14
+  ): Promise<{ uploadedKey: string | null; prunedBackups: number }> {
+    const r2 = this.createR2Client(settings);
+    if (!r2 || !settings.r2BucketName) {
+      return { uploadedKey: null, prunedBackups: 0 };
+    }
+    const dayStr = new Date().toISOString().slice(0, 10);
+    const key = `backups/syncflow-${dayStr}.sqlite`;
+    const tmpPath = path.join(this.dataDir, `.backup-${dayStr}-${Date.now()}.sqlite`);
+    try {
+      writeBackup(tmpPath);
+      const upload = new Upload({
+        client: r2,
+        params: {
+          Bucket: settings.r2BucketName,
+          Key: key,
+          Body: fs.createReadStream(tmpPath),
+          ContentType: 'application/x-sqlite3',
+        },
+      });
+      await upload.done();
+
+      let prunedBackups = 0;
+      try {
+        const listed = await r2.send(
+          new ListObjectsV2Command({
+            Bucket: settings.r2BucketName,
+            Prefix: 'backups/syncflow-',
+          })
+        );
+        const cutoffMs = Date.now() - Math.max(1, keepDays) * 24 * 60 * 60_000;
+        for (const obj of listed.Contents ?? []) {
+          if (obj.Key && obj.Key !== key && obj.LastModified && obj.LastModified.getTime() < cutoffMs) {
+            await r2
+              .send(
+                new DeleteObjectCommand({
+                  Bucket: settings.r2BucketName,
+                  Key: obj.Key,
+                })
+              )
+              .catch(() => {});
+            prunedBackups++;
+          }
+        }
+      } catch {
+        // Best-effort pruning
+      }
+
+      return { uploadedKey: key, prunedBackups };
+    } finally {
+      await fs.promises.unlink(tmpPath).catch(() => {});
     }
   }
 }

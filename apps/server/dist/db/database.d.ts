@@ -153,6 +153,7 @@ export declare class ClipFlowDb {
     getContent(id: string): ContentItem | null;
     createContentWithJobs(input: {
         id?: string;
+        draftContentId?: string;
         channelId: string;
         mediaAssetId: string;
         targetDate: string;
@@ -212,6 +213,8 @@ export declare class ClipFlowDb {
     private setSettingRaw;
     getSettingsFull(): AppSettingsFull;
     getSettingsPublic(): AppSettingsPublic;
+    listExpiredMediaAssets(olderThanDays?: number): MediaAsset[];
+    backupToFile(destPath: string): void;
     updateSettings(patch: Partial<AppSettingsFull>): AppSettingsPublic;
 }
 //# sourceMappingURL=database.d.ts.map

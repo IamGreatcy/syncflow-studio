@@ -46,14 +46,15 @@ const app = createApp({
     onRestartRequested: () => {
         // Exit non-zero so the host (Railway restart policy / Docker) restarts the container
         // and the start command re-pulls the latest release.
-        scheduler.stop();
-        try {
-            db.close();
-        }
-        catch {
-            // ignore
-        }
-        process.exit(1);
+        void scheduler.stopAndDrain(12_000).finally(() => {
+            try {
+                db.close();
+            }
+            catch {
+                // ignore
+            }
+            process.exit(1);
+        });
     },
 });
 const port = Number(process.env.PORT || 3001);
@@ -67,11 +68,28 @@ const server = serve({
     console.log(`[SyncFlow Studio] Server running on http://${hostname === '0.0.0.0' ? 'localhost' : hostname}:${info.port} (bind ${hostname})`);
     console.log(`[SyncFlow Studio] Data directory: ${dataDir}`);
 });
+let shuttingDown = false;
 function shutdown() {
-    scheduler.stop();
-    server.close(() => {
-        db.close();
+    if (shuttingDown)
+        return;
+    shuttingDown = true;
+    const forceTimer = setTimeout(() => {
+        try {
+            db.close();
+        }
+        catch { }
         process.exit(0);
+    }, 18_000);
+    forceTimer.unref();
+    void scheduler.stopAndDrain(15_000).finally(() => {
+        server.close(() => {
+            try {
+                db.close();
+            }
+            catch { }
+            clearTimeout(forceTimer);
+            process.exit(0);
+        });
     });
 }
 process.on('SIGINT', shutdown);

@@ -60,7 +60,7 @@ export function seedDefaultChannelData(db, channelId) {
             descriptionFooter: '',
             defaultHashtags: ['#Shorts'],
             defaultTags: ['ความรู้รอบตัว', 'สาระน่ารู้'],
-            defaultCta: 'กดติดตามไว้ไม่พลาดคลิปใหม่!',
+            defaultCta: '',
         },
         {
             format: 'YOUTUBE_LONG',
@@ -71,7 +71,7 @@ export function seedDefaultChannelData(db, channelId) {
             descriptionFooter: '───────────────\nขอบคุณที่รับชมครับ มีคำถามคอมเมนต์ไว้ได้เลย',
             defaultHashtags: ['#ความรู้รอบตัว', '#สาระดีๆ'],
             defaultTags: ['สาระความรู้', 'อธิบายเข้าใจง่าย'],
-            defaultCta: 'คิดเห็นยังไง คอมเมนต์คุยกันและฝากกด Subscribe ด้วยนะครับ',
+            defaultCta: '',
         },
         {
             format: 'TIKTOK',
@@ -82,7 +82,7 @@ export function seedDefaultChannelData(db, channelId) {
             descriptionFooter: '',
             defaultHashtags: ['#สาระน่ารู้', '#ความรู้รอบตัว'],
             defaultTags: [],
-            defaultCta: 'เคยสงสัยไหม? คอมเมนต์หรือ Save เก็บไว้เลย 👇',
+            defaultCta: '',
         },
         {
             format: 'INSTAGRAM_REELS',
@@ -93,7 +93,7 @@ export function seedDefaultChannelData(db, channelId) {
             descriptionFooter: '',
             defaultHashtags: ['#สาระน่ารู้', '#แชร์ความรู้'],
             defaultTags: [],
-            defaultCta: 'กด Save หรือส่งต่อให้เพื่อนได้เลย!',
+            defaultCta: '',
         },
         {
             format: 'FACEBOOK_REELS',
@@ -104,7 +104,7 @@ export function seedDefaultChannelData(db, channelId) {
             descriptionFooter: '',
             defaultHashtags: ['#สาระน่ารู้', '#เล่าเรื่องน่ารู้'],
             defaultTags: [],
-            defaultCta: 'คิดเห็นยังไง คอมเมนต์คุยกันได้เลยครับ!',
+            defaultCta: '',
         },
         {
             format: 'FACEBOOK_VIDEO',
@@ -115,7 +115,7 @@ export function seedDefaultChannelData(db, channelId) {
             descriptionFooter: 'กดติดตามเพจไว้เพื่อไม่พลาดเรื่องราวน่ารู้ตอนใหม่ครับ',
             defaultHashtags: ['#สาระดีๆ', '#เรื่องน่ารู้'],
             defaultTags: [],
-            defaultCta: 'เห็นด้วยไหมครับ? คอมเมนต์แลกเปลี่ยนมุมมองกันได้เลย หรือแชร์ต่อให้คนใกล้ตัว!',
+            defaultCta: '',
         },
     ];
     for (const t of templateDefaults) {

@@ -87,11 +87,20 @@ export async function fetchWithRetry(input, init, options) {
     const retries = options?.retries ?? 2;
     const baseDelayMs = options?.baseDelayMs ?? 350;
     const maxDelayMs = options?.maxDelayMs ?? 2000;
+    const timeoutMs = options?.timeoutMs;
     const retryOnStatus = options?.retryOnHttpStatuses ?? true;
     let lastError;
     for (let attempt = 0; attempt <= retries; attempt++) {
         try {
-            const res = await fetch(input, init);
+            let reqInit = init;
+            if (timeoutMs && timeoutMs > 0) {
+                const timeoutSignal = AbortSignal.timeout(timeoutMs);
+                const combinedSignal = init?.signal
+                    ? AbortSignal.any([init.signal, timeoutSignal])
+                    : timeoutSignal;
+                reqInit = { ...init, signal: combinedSignal };
+            }
+            const res = await fetch(input, reqInit);
             if (retryOnStatus &&
                 attempt < retries &&
                 TRANSIENT_HTTP_STATUS.has(res.status)) {
@@ -103,7 +112,11 @@ export async function fetchWithRetry(input, init, options) {
         }
         catch (err) {
             lastError = err;
-            if (attempt < retries && isTransientNetworkError(err)) {
+            const callerAborted = Boolean(init?.signal?.aborted);
+            const isTimeoutErr = !callerAborted &&
+                err instanceof Error &&
+                (err.name === 'TimeoutError' || err.name === 'AbortError');
+            if (attempt < retries && (isTimeoutErr || isTransientNetworkError(err))) {
                 const delay = Math.min(maxDelayMs, baseDelayMs * Math.pow(2, attempt) + Math.floor(Math.random() * 250));
                 await new Promise((r) => setTimeout(r, delay));
                 continue;

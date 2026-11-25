@@ -12,7 +12,7 @@ import type {
   PublishResult,
 } from './types.js';
 
-const GRAPH_VERSION = 'v22.0';
+const GRAPH_VERSION = 'v27.0';
 
 export interface DiscoveredMetaPageFull {
   pageId: string;

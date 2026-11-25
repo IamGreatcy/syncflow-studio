@@ -15,6 +15,7 @@ export declare class YouTubeAdapter implements PlatformAdapter {
     refreshAccessToken(refreshToken: string, credentials?: OAuthAppCredentials): Promise<OAuthTokenResponse>;
     preUploadSchedule(ctx: AdapterContext): Promise<PreUploadResult>;
     private uploadFileInChunks;
+    private uploadChunkWithResume;
     publishNow(ctx: AdapterContext): Promise<PublishResult>;
     updateSchedule(params: {
         ctx: AdapterContext;

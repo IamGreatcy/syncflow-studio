@@ -1,6 +1,6 @@
 import fs from 'node:fs';
 import { randomBytes } from 'node:crypto';
-const GRAPH_VERSION = 'v22.0';
+const GRAPH_VERSION = 'v27.0';
 export async function discoverMetaPages(accessToken) {
     const url = `https://graph.facebook.com/${GRAPH_VERSION}/me/accounts?fields=id,name,access_token,instagram_business_account{id,username,name}&access_token=${encodeURIComponent(accessToken)}`;
     const res = await fetch(url);

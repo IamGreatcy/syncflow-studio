@@ -45,6 +45,7 @@ import {
 import { FORMAT_LABELS, PlatformPill, StrategyBadge } from './PlatformBadge';
 
 export interface PlannerPrefill {
+  draftContentId?: string;
   asset: MediaAsset;
   brief: MasterBrief;
   metadata: PlatformMetadataMap;
@@ -452,6 +453,7 @@ export function ContentPlannerModal({
     setErrorMsg(null);
     try {
       await api.createContent({
+        draftContentId: prefill?.draftContentId,
         channelId: channel.id,
         mediaAssetId: asset.id,
         targetDate,
@@ -1254,9 +1256,22 @@ export function ContentPlannerModal({
               </div>
 
               {engineUsedMsg && (
-                <p className="text-[12px] font-medium text-apple-green">
-                  {engineUsedMsg}
-                </p>
+                <div
+                  className={
+                    /DETERMINISTIC/i.test(engineUsedMsg)
+                      ? 'flex items-center gap-2 rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-[12px] font-medium text-amber-800'
+                      : 'text-[12px] font-medium text-apple-green'
+                  }
+                >
+                  {/DETERMINISTIC/i.test(engineUsedMsg) && (
+                    <AlertTriangle className="h-3.5 w-3.5 shrink-0 text-amber-600" />
+                  )}
+                  <span>
+                    {/DETERMINISTIC/i.test(engineUsedMsg)
+                      ? `${engineUsedMsg} — ระบบ AI ตอบสนองช้าจึงใช้ชุดข้อความสำรองชั่วคราว (กด "สร้างใหม่อัตโนมัติ" เพื่อลองสร้างด้วย AI อีกครั้ง)`
+                      : engineUsedMsg}
+                  </span>
+                </div>
               )}
 
               {(activeTab === 'YOUTUBE_SHORTS' ||

@@ -410,6 +410,7 @@ export const api = {
   },
 
   createContent: (payload: {
+    draftContentId?: string;
     channelId: string;
     mediaAssetId: string;
     targetDate: string;

@@ -1098,6 +1098,7 @@ export class ClipFlowDb {
 
   createContentWithJobs(input: {
     id?: string;
+    draftContentId?: string;
     channelId: string;
     mediaAssetId: string;
     targetDate: string;
@@ -1114,10 +1115,27 @@ export class ClipFlowDb {
     }>;
   }): ContentItem {
     const now = new Date().toISOString();
-    const contentId = input.id ?? `cnt_${randomUUID().slice(0, 8)}`;
+    let contentId = input.id ?? `cnt_${randomUUID().slice(0, 8)}`;
 
     this.sqlite.exec('BEGIN IMMEDIATE;');
     try {
+      let reusingDraft = false;
+      if (input.draftContentId) {
+        const draftRow = plain<{ id: string; status: string }>(
+          this.sqlite
+            .prepare('SELECT id, status FROM content_items WHERE id = ?')
+            .get(input.draftContentId)
+        );
+        const existingJobsRow = plain<{ cnt: number }>(
+          this.sqlite
+            .prepare('SELECT COUNT(*) AS cnt FROM publish_jobs WHERE content_item_id = ?')
+            .get(input.draftContentId)
+        );
+        if (draftRow && draftRow.status === 'DRAFT' && Number(existingJobsRow?.cnt ?? 0) === 0) {
+          contentId = draftRow.id;
+          reusingDraft = true;
+        }
+      }
       for (const target of input.jobs) {
         if (target.format !== 'FACEBOOK_REELS') continue;
         const account = this.getAccount(target.socialAccountId);
@@ -1151,24 +1169,44 @@ export class ClipFlowDb {
         ).get(input.mediaAssetId, account.id, account.externalAccountId, account.externalAccountId, target.scheduledAt);
         if (duplicate) throw new FacebookReelDuplicateError('มีงาน Facebook Reel สำหรับคลิปและเพจนี้อยู่แล้ว ตรวจสอบคิวเดิมก่อน');
       }
-      this.sqlite
-        .prepare(
-          `INSERT INTO content_items (
-            id, channel_id, media_asset_id, target_date, master_brief_json,
-            platform_metadata_json, status, created_at, updated_at
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
-        )
-        .run(
-          contentId,
-          input.channelId,
-          input.mediaAssetId,
-          input.targetDate,
-          JSON.stringify(input.masterBrief),
-          JSON.stringify(input.platformMetadata),
-          input.jobs.length > 0 ? 'SCHEDULED' : 'DRAFT',
-          now,
-          now
-        );
+      if (reusingDraft) {
+        this.sqlite
+          .prepare(
+            `UPDATE content_items
+             SET channel_id = ?, media_asset_id = ?, target_date = ?, master_brief_json = ?,
+                 platform_metadata_json = ?, status = ?, updated_at = ?
+             WHERE id = ?`
+          )
+          .run(
+            input.channelId,
+            input.mediaAssetId,
+            input.targetDate,
+            JSON.stringify(input.masterBrief),
+            JSON.stringify(input.platformMetadata),
+            input.jobs.length > 0 ? 'SCHEDULED' : 'DRAFT',
+            now,
+            contentId
+          );
+      } else {
+        this.sqlite
+          .prepare(
+            `INSERT INTO content_items (
+              id, channel_id, media_asset_id, target_date, master_brief_json,
+              platform_metadata_json, status, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+          )
+          .run(
+            contentId,
+            input.channelId,
+            input.mediaAssetId,
+            input.targetDate,
+            JSON.stringify(input.masterBrief),
+            JSON.stringify(input.platformMetadata),
+            input.jobs.length > 0 ? 'SCHEDULED' : 'DRAFT',
+            now,
+            now
+          );
+      }
 
       const jobStmt = this.sqlite.prepare(
         `INSERT INTO publish_jobs (
@@ -1391,13 +1429,15 @@ export class ClipFlowDb {
                  OR (status = 'QUEUED' AND strategy = 'JIT_PUBLISH' AND (prewarm_at IS NULL OR prewarm_at <= ?))
                  OR (status = 'READY_TO_PUBLISH' AND scheduled_at <= ?)
                  OR (status = 'NATIVE_SCHEDULED' AND scheduled_at <= ?)
+                 OR (format != 'FACEBOOK_REELS' AND status IN ('PREUPLOADING', 'PREWARMING', 'PUBLISHING')
+                     AND locked_until IS NOT NULL AND locked_until < ?)
                  OR (format = 'FACEBOOK_REELS' AND facebook_reel_json IS NOT NULL
                      AND status IN ('PREUPLOADING', 'UPLOADED', 'PROCESSING', 'PUBLISH_REQUESTED'))
                )
              ORDER BY scheduled_at ASC
              LIMIT ?`
           )
-          .all(nowIso, nowIso, Number(allowLiveFacebookReels), nowIso, nowIso, nowIso, limit)
+          .all(nowIso, nowIso, Number(allowLiveFacebookReels), nowIso, nowIso, nowIso, nowIso, limit)
       );
 
       const claimed: PublishJob[] = [];
@@ -1767,6 +1807,47 @@ export class ClipFlowDb {
       tiktokClientKey: full.tiktokClientKey,
       hasTiktokClientSecret: Boolean(full.tiktokClientSecret),
     };
+  }
+
+  listExpiredMediaAssets(olderThanDays = 30): MediaAsset[] {
+    const cutoffIso = new Date(
+      Date.now() - Math.max(1, olderThanDays) * 24 * 60 * 60_000
+    ).toISOString();
+    const rows = plainList<Record<string, unknown>>(
+      this.sqlite
+        .prepare(
+          `SELECT m.* FROM media_assets m
+           WHERE m.created_at < ?
+             AND EXISTS (
+               SELECT 1 FROM content_items c
+               JOIN publish_jobs j ON j.content_item_id = c.id
+               WHERE c.media_asset_id = m.id
+             )
+             AND NOT EXISTS (
+               SELECT 1 FROM content_items c
+               WHERE c.media_asset_id = m.id AND c.status IN ('DRAFT', 'SCHEDULED')
+             )
+             AND NOT EXISTS (
+               SELECT 1 FROM content_items c
+               JOIN publish_jobs j ON j.content_item_id = c.id
+               WHERE c.media_asset_id = m.id
+                 AND j.status NOT IN ('PUBLISHED', 'CANCELLED')
+             )
+             AND NOT EXISTS (
+               SELECT 1 FROM content_items c
+               JOIN publish_jobs j ON j.content_item_id = c.id
+               WHERE c.media_asset_id = m.id
+                 AND j.updated_at >= ?
+             )`
+        )
+        .all(cutoffIso, cutoffIso)
+    );
+    return rows.map((r) => this.mapMediaAsset(r));
+  }
+
+  backupToFile(destPath: string): void {
+    const escaped = destPath.replace(/'/g, "''");
+    this.sqlite.exec(`VACUUM INTO '${escaped}'`);
   }
 
   updateSettings(patch: Partial<AppSettingsFull>): AppSettingsPublic {

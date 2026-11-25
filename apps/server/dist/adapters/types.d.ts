@@ -29,6 +29,7 @@ export interface PreWarmResult {
 export interface PublishResult {
     externalPostId: string;
     externalUrl: string | null;
+    inboxDraft?: boolean;
 }
 export interface OAuthAppCredentials {
     googleClientId?: string;

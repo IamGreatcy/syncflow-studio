@@ -905,6 +905,7 @@ export function createApp(params) {
             const uploadResult = await new Promise((resolve, reject) => {
                 const bb = Busboy({
                     headers: headersObj,
+                    defParamCharset: 'utf8',
                     limits: { fileSize: 4 * 1024 * 1024 * 1024 }, // 4 GB ceiling
                 });
                 let channelId = '';
@@ -1280,6 +1281,7 @@ export function createApp(params) {
                 .min(1),
             allowImmediate: z.boolean().optional(),
             dispatchImmediately: z.boolean().optional(),
+            draftContentId: z.string().min(1).optional(),
         });
         const parsed = schema.safeParse(body);
         if (!parsed.success) {
@@ -1353,6 +1355,7 @@ export function createApp(params) {
         let content;
         try {
             content = db.createContentWithJobs({
+                draftContentId: parsed.data.draftContentId,
                 channelId: channel.id,
                 mediaAssetId: asset.id,
                 targetDate: parsed.data.targetDate,
@@ -1371,7 +1374,7 @@ export function createApp(params) {
             db.addJobLog(j.id, 'INFO', 'JOB_CREATED', `สร้างคิวงาน ${j.format} (${j.strategy}) เวลา ${j.scheduledAt}`);
         }
         if (parsed.data.dispatchImmediately !== false) {
-            await scheduler.tick(new Date());
+            scheduler.nudge();
         }
         return c.json({ content: db.getContent(content.id) }, 201);
     });
@@ -1776,6 +1779,7 @@ export function createApp(params) {
             const parsedUpload = await new Promise((resolve, reject) => {
                 const bb = Busboy({
                     headers: headersObj,
+                    defParamCharset: 'utf8',
                     limits: { fileSize: 4 * 1024 * 1024 * 1024 },
                 });
                 let channelId = '';

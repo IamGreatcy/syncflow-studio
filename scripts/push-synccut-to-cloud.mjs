@@ -107,6 +107,8 @@ async function main() {
     exportId: bestExp.id,
     version: bestExp.version,
     shotCount: targetEp.shots?.length ?? 1,
+    visualStyle: targetEp.production?.visualStyle ?? undefined,
+    requiresRealisticAiDisclosure: Boolean(brief.isSyntheticMedia),
     projectTitle: brief.topic,
     language: brief.language,
     tone: brief.tone,

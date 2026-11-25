@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import { randomBytes } from 'node:crypto';
 import { FacebookAdapter } from './facebook.js';
 import { fetchWithRetry, isTransientNetworkError, } from '../services/net-resilience.js';
-const GRAPH_VERSION = 'v22.0';
+const GRAPH_VERSION = 'v27.0';
 const fbHelper = new FacebookAdapter();
 export class InstagramAdapter {
     platform = 'INSTAGRAM';
@@ -133,7 +133,9 @@ export class InstagramAdapter {
             const uploadUri = initJson.uri ||
                 `https://rupload.facebook.com/ig-api-upload/${GRAPH_VERSION}/${containerId}`;
             const stat = await fs.promises.stat(uploadFilePath);
-            const fileBuf = await fs.promises.readFile(uploadFilePath);
+            const fileBlob = await fs.openAsBlob(uploadFilePath, {
+                type: 'application/octet-stream',
+            });
             const upRes = await fetchWithRetry(uploadUri, {
                 method: 'POST',
                 headers: {
@@ -142,8 +144,8 @@ export class InstagramAdapter {
                     file_size: String(stat.size),
                     'Content-Type': 'application/octet-stream',
                 },
-                body: fileBuf,
-            });
+                body: fileBlob,
+            }, { timeoutMs: 120_000 });
             if (!upRes.ok) {
                 throw new Error(`IG rupload failed: ${await upRes.text()}`);
             }
@@ -220,9 +222,22 @@ export class InstagramAdapter {
             }
         }
         const pubJson = (await pubRes.json());
+        let externalUrl = `https://www.instagram.com/reel/${pubJson.id}/`;
+        try {
+            const linkRes = await fetchWithRetry(`https://graph.facebook.com/${GRAPH_VERSION}/${encodeURIComponent(pubJson.id)}?fields=permalink&access_token=${encodeURIComponent(ctx.accessToken)}`, undefined, { retries: 1, timeoutMs: 5_000 });
+            if (linkRes.ok) {
+                const linkData = (await linkRes.json());
+                if (linkData.permalink && /^https:\/\/www\.instagram\.com\//i.test(linkData.permalink)) {
+                    externalUrl = linkData.permalink;
+                }
+            }
+        }
+        catch {
+            // Best-effort permalink lookup
+        }
         return {
             externalPostId: pubJson.id,
-            externalUrl: `https://www.instagram.com/reels/${pubJson.id}/`,
+            externalUrl,
         };
     }
 }

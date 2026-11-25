@@ -1,4 +1,5 @@
 import fs from 'node:fs/promises';
+import { createReadStream, openAsBlob } from 'node:fs';
 import { createHash } from 'node:crypto';
 import type { FacebookReelPublication, FacebookReelsMetadata, JobStatus, PublishJob } from '@clipflow/shared';
 import type { AdapterContext, AdapterLogFn } from './types.js';
@@ -186,12 +187,28 @@ export function inspect(body: Json) {
 
 export async function prepareFacebookReelMedia(ctx: AdapterContext): Promise<Media> {
   if (ctx.asset.probe.durationSec > 90) throw new Error('Reels duration exceeds 90 seconds.');
-  const path = ctx.hasCustomCover && ctx.getCoverVideoPath && ctx.asset.probe.durationSec + 0.2 <= 90
-    ? await ctx.getCoverVideoPath() : ctx.localFilePath;
+  const skipPrepend =
+    process.env.SYNCFLOW_FB_SKIP_COVER_PREPEND === '1' && Boolean(ctx.thumbnailPath);
+  const path =
+    !skipPrepend &&
+    ctx.hasCustomCover &&
+    ctx.getCoverVideoPath &&
+    ctx.asset.probe.durationSec + 0.2 <= 90
+      ? await ctx.getCoverVideoPath()
+      : ctx.localFilePath;
   if (path !== ctx.localFilePath) {
     ctx.log('INFO', 'FB_REELS_COVER_FRAME_INJECTED', 'Cover frame prepended before the Facebook Reel upload.');
   }
   return { path, thumbnailPath: ctx.thumbnailPath };
+}
+
+async function hashAndStatFile(filePath: string): Promise<{ size: number; sha256: string }> {
+  const st = await fs.stat(filePath);
+  const hash = createHash('sha256');
+  for await (const chunk of createReadStream(filePath)) {
+    hash.update(chunk as Buffer);
+  }
+  return { size: st.size, sha256: hash.digest('hex') };
 }
 
 export async function runFacebookReel(ctx: Context): Promise<void> {
@@ -249,14 +266,14 @@ export async function runFacebookReel(ctx: Context): Promise<void> {
     return;
   }
 
-  let file: Buffer | undefined;
+  let mediaInfo: { path: string; size: number; sha256: string } | undefined;
   let thumbnailPath: string | null = null;
-  async function loadFile(): Promise<Buffer | undefined> {
+  async function loadMediaFile(): Promise<{ path: string; size: number; sha256: string } | undefined> {
     try {
       const media = await ctx.loadMedia();
       thumbnailPath = media.thumbnailPath;
-      const bytes = await fs.readFile(media.path);
-      if (bytes.length) return bytes;
+      const hashed = await hashAndStatFile(media.path);
+      if (hashed.size > 0) return { path: media.path, ...hashed };
     } catch {}
     record({ status: 'FAILED', nextRetryAt: null, lastError: 'The Reel source could not be read.' });
   }
@@ -279,8 +296,8 @@ export async function runFacebookReel(ctx: Context): Promise<void> {
       }
       return;
     }
-    file = await loadFile();
-    if (!file) return;
+    mediaInfo = await loadMediaFile();
+    if (!mediaInfo) return;
     reel.startRequestedAt = clock().toISOString();
     record({ status: 'PREUPLOADING' });
     const response = await request(edge, 'START', token, clock(), {
@@ -408,22 +425,30 @@ export async function runFacebookReel(ctx: Context): Promise<void> {
   }
 
   if (!reel.uploadedAt) {
-    file ??= await loadFile();
-    if (!file) return;
-    const digest = createHash('sha256').update(file).digest('hex');
+    mediaInfo ??= await loadMediaFile();
+    if (!mediaInfo) return;
+    const digest = mediaInfo.sha256;
     const uploadUrl = safeUploadUrl(reel.uploadUrl, videoId);
-    if (!uploadUrl || !file.length || (reel.fileSha256 && reel.fileSha256 !== digest)) {
+    if (!uploadUrl || !mediaInfo.size || (reel.fileSha256 && reel.fileSha256 !== digest)) {
       record({ status: 'UNKNOWN', nextRetryAt: null, lastError: 'The original Reel upload session or source file could not be validated.' });
       return;
     }
     reel.fileSha256 = digest;
-    reel.fileSize = file.length;
+    reel.fileSize = mediaInfo.size;
     reel.uploadRequestedAt = clock().toISOString();
     record({ status: 'PREUPLOADING' });
+    let uploadBody: BodyInit;
+    if (mediaInfo.size > 16 * 1024 * 1024) {
+      const fileBlob = await openAsBlob(mediaInfo.path, { type: 'application/octet-stream' });
+      uploadBody = (offset > 0 ? fileBlob.slice(offset) : fileBlob) as unknown as BodyInit;
+    } else {
+      const buf = await fs.readFile(mediaInfo.path);
+      uploadBody = (offset > 0 ? buf.subarray(offset) : buf) as unknown as BodyInit;
+    }
     const response = await request(uploadUrl, 'UPLOAD', token, clock(), {
       method: 'POST',
-      headers: { Authorization: 'OAuth ' + token, offset: String(offset), file_size: String(file.length), 'Content-Type': 'application/octet-stream' },
-      body: file.subarray(offset) as unknown as BodyInit,
+      headers: { Authorization: 'OAuth ' + token, offset: String(offset), file_size: String(mediaInfo.size), 'Content-Type': 'application/octet-stream' },
+      body: uploadBody,
     }, 90_000);
     observe(response, 'UPLOAD', response.body.success !== true);
     if (response.error || response.body.success !== true) {

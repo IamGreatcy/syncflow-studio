@@ -315,6 +315,7 @@ export class TikTokAdapter {
                     return {
                         externalPostId: inboxInit.publishId,
                         externalUrl: `https://www.tiktok.com/@${(info.creatorUsername || ctx.account.externalAccountId).replace(/^@/, '')}`,
+                        inboxDraft: true,
                     };
                 }
                 catch (inboxErr) {

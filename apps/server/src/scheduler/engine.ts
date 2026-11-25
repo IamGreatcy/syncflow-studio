@@ -39,8 +39,12 @@ export function facebookReelRuntime(env: NodeJS.ProcessEnv) {
 export class SchedulerEngine {
   private timer: NodeJS.Timeout | null = null;
   private tokenTimer: NodeJS.Timeout | null = null;
+  private maintenanceTimer: NodeJS.Timeout | null = null;
   private isTickRunning = false;
+  private currentTickPromise: Promise<unknown> | null = null;
+  private readonly tokenRefreshLocks = new Map<string, Promise<boolean>>();
   lastTickAt: string | null = null;
+  lastBackupAt: string | null = null;
 
   constructor(
     private readonly db: ClipFlowDb,
@@ -63,6 +67,14 @@ export class SchedulerEngine {
       });
     }, 30 * 60_000);
 
+    // Daily R2 backup + stale cache & expired media garbage collection (every 24h)
+    this.maintenanceTimer = setInterval(() => {
+      void this.runDailyMaintenance().catch((err) => {
+        console.error('[Scheduler] maintenance error:', err);
+      });
+    }, 24 * 60 * 60_000);
+    this.maintenanceTimer.unref?.();
+
     // Kick off an initial tick shortly after boot
     setTimeout(() => {
       void this.tick().catch(() => {});
@@ -78,6 +90,54 @@ export class SchedulerEngine {
       clearInterval(this.tokenTimer);
       this.tokenTimer = null;
     }
+    if (this.maintenanceTimer) {
+      clearInterval(this.maintenanceTimer);
+      this.maintenanceTimer = null;
+    }
+  }
+
+  async stopAndDrain(timeoutMs = 15_000): Promise<void> {
+    this.stop();
+    if (!this.currentTickPromise) return;
+    await Promise.race([
+      this.currentTickPromise.catch(() => {}),
+      new Promise((resolve) => setTimeout(resolve, timeoutMs)),
+    ]);
+  }
+
+  async runDailyMaintenance(retentionDays = 30): Promise<{
+    backupKey: string | null;
+    prunedCoverCache: number;
+    reclaimedMediaAssets: number;
+  }> {
+    const settings = this.db.getSettingsFull();
+    let backupKey: string | null = null;
+    try {
+      const backupRes = await this.storage.backupDatabaseToR2(
+        (dest) => this.db.backupToFile(dest),
+        settings,
+        14
+      );
+      backupKey = backupRes.uploadedKey;
+      if (backupKey) this.lastBackupAt = new Date().toISOString();
+    } catch (err) {
+      console.error('[Scheduler] R2 SQLite backup failed:', err);
+    }
+
+    const prunedCoverCache = await this.storage.pruneOldCoverCache(7).catch(() => 0);
+
+    let reclaimedMediaAssets = 0;
+    try {
+      const expiredAssets = this.db.listExpiredMediaAssets(retentionDays);
+      for (const asset of expiredAssets) {
+        await this.storage.deleteMediaAssetFiles(asset, settings);
+        reclaimedMediaAssets++;
+      }
+    } catch (err) {
+      console.error('[Scheduler] Expired media GC failed:', err);
+    }
+
+    return { backupKey, prunedCoverCache, reclaimedMediaAssets };
   }
 
   nudge(): void {
@@ -97,8 +157,9 @@ export class SchedulerEngine {
     this.lastTickAt = now.toISOString();
     const tickStartedAt = performance.now();
 
-    try {
-      const dueJobs = this.db.claimDueJobs(now.toISOString(), 10, this.liveFacebookReelsEnabled);
+    const runPromise = (async () => {
+      try {
+        const dueJobs = this.db.claimDueJobs(now.toISOString(), 10, this.liveFacebookReelsEnabled);
       const results: Array<{ jobId: string; status: string }> = [];
       const seenLiveOfficialAccountIds = new Set<string>();
 
@@ -123,9 +184,13 @@ export class SchedulerEngine {
       }
 
       return { processed: results.length, results };
-    } finally {
-      this.isTickRunning = false;
-    }
+      } finally {
+        this.isTickRunning = false;
+        this.currentTickPromise = null;
+      }
+    })();
+    this.currentTickPromise = runPromise;
+    return runPromise;
   }
 
   async runJobNow(
@@ -257,6 +322,52 @@ export class SchedulerEngine {
     })!;
   }
 
+  async refreshAccountTokenLocked(
+    accountId: string,
+    maxRemainingMs = 24 * 3600_000,
+    now: Date = new Date()
+  ): Promise<boolean> {
+    const existing = this.tokenRefreshLocks.get(accountId);
+    if (existing) return existing;
+
+    const promise = (async () => {
+      const full = this.db.getAccountWithSecrets(accountId);
+      if (!full || full.account.connectionMode !== 'LIVE_OFFICIAL') return false;
+      if (!full.account.tokenExpiresAt || !full.refreshToken) return false;
+
+      const expMs = new Date(full.account.tokenExpiresAt).getTime();
+      if (expMs - now.getTime() > maxRemainingMs) return false;
+
+      const adapter = getAdapter(full.account.platform);
+      if (!adapter.refreshAccessToken) return false;
+
+      try {
+        const settings = this.db.getSettingsFull();
+        const nextTokens = await adapter.refreshAccessToken(
+          full.refreshToken,
+          settings
+        );
+        this.db.updateAccount(accountId, {
+          accessToken: nextTokens.accessToken,
+          refreshToken: nextTokens.refreshToken ?? full.refreshToken,
+          tokenExpiresAt: nextTokens.expiresAt ?? null,
+          status: 'CONNECTED',
+        });
+        return true;
+      } catch (err) {
+        if (!isTransientNetworkError(err)) {
+          this.db.updateAccount(accountId, { status: 'NEEDS_REAUTH' });
+        }
+        return false;
+      }
+    })().finally(() => {
+      this.tokenRefreshLocks.delete(accountId);
+    });
+
+    this.tokenRefreshLocks.set(accountId, promise);
+    return promise;
+  }
+
   async refreshExpiringTokens(now: Date = new Date()): Promise<number> {
     const accounts = this.db.listAccounts();
     let refreshed = 0;
@@ -268,29 +379,8 @@ export class SchedulerEngine {
       const expMs = new Date(acc.tokenExpiresAt).getTime();
       if (expMs - now.getTime() > 24 * 3600_000) continue;
 
-      const full = this.db.getAccountWithSecrets(acc.id);
-      if (!full?.refreshToken) continue;
-
-      const adapter = getAdapter(acc.platform);
-      if (!adapter.refreshAccessToken) continue;
-
-      try {
-        const settings = this.db.getSettingsFull();
-        const nextTokens = await adapter.refreshAccessToken(
-          full.refreshToken,
-          settings
-        );
-        this.db.updateAccount(acc.id, {
-          accessToken: nextTokens.accessToken,
-          refreshToken: nextTokens.refreshToken ?? full.refreshToken,
-          tokenExpiresAt: nextTokens.expiresAt ?? null,
-          status: 'CONNECTED',
-        });
+      if (await this.refreshAccountTokenLocked(acc.id, 24 * 3600_000, now)) {
         refreshed++;
-      } catch (err) {
-        if (!isTransientNetworkError(err)) {
-          this.db.updateAccount(acc.id, { status: 'NEEDS_REAUTH' });
-        }
       }
     }
 
@@ -364,30 +454,21 @@ export class SchedulerEngine {
       customCoverPath && fs.existsSync(customCoverPath)
     );
 
-    // Refresh token right before execution if expiring within 60 minutes
-    let accessToken = accountData.accessToken;
-    let refreshToken = accountData.refreshToken;
+    // Refresh token right before execution if expiring within 60 minutes (per-account mutex prevents refresh races)
     if (
       accountData.account.connectionMode === 'LIVE_OFFICIAL' &&
       accountData.account.tokenExpiresAt &&
-      refreshToken
+      accountData.refreshToken
     ) {
       const expMs = new Date(accountData.account.tokenExpiresAt).getTime();
       if (expMs - Date.now() < 60 * 60_000) {
-        const adapter = getAdapter(job.platform);
-        if (adapter.refreshAccessToken) {
-          const next = await adapter.refreshAccessToken(refreshToken, settings);
-          accessToken = next.accessToken;
-          refreshToken = next.refreshToken ?? refreshToken;
-          this.db.updateAccount(accountData.account.id, {
-            accessToken,
-            refreshToken,
-            tokenExpiresAt: next.expiresAt ?? null,
-            status: 'CONNECTED',
-          });
-        }
+        await this.refreshAccountTokenLocked(accountData.account.id, 60 * 60_000);
       }
     }
+    const latestAccountData =
+      this.db.getAccountWithSecrets(job.socialAccountId) ?? accountData;
+    const accessToken = latestAccountData.accessToken;
+    const refreshToken = latestAccountData.refreshToken;
 
     return {
       job,
@@ -469,11 +550,27 @@ export class SchedulerEngine {
       }
 
       const adapter = getAdapter(job.platform);
+      const effectiveStatus =
+        job.status === 'PREUPLOADING' || job.status === 'PREWARMING'
+          ? 'QUEUED'
+          : job.status === 'PUBLISHING'
+            ? job.externalPostId
+              ? 'NATIVE_SCHEDULED'
+              : 'READY_TO_PUBLISH'
+            : job.status;
+      if (effectiveStatus !== job.status) {
+        this.db.addJobLog(
+          job.id,
+          'WARN',
+          'STALE_JOB_RECOVERED',
+          `กู้คืนงาน ${job.format} ที่ค้างในสถานะ ${job.status} หลังหมดเวลาล็อก → ดำเนินการต่อในสถานะ ${effectiveStatus}`
+        );
+      }
 
       // Step 1: Native Pre-upload (YouTube / Facebook) or Inbox Draft (TikTok)
       if (
         !forcePublishNow &&
-        job.status === 'QUEUED' &&
+        effectiveStatus === 'QUEUED' &&
         (job.strategy === 'NATIVE_PREUPLOAD' || job.strategy === 'INBOX_DRAFT') &&
         adapter.preUploadSchedule
       ) {
@@ -493,7 +590,7 @@ export class SchedulerEngine {
       if (
         !forcePublishNow &&
         !isDueToPublish &&
-        job.status === 'QUEUED' &&
+        effectiveStatus === 'QUEUED' &&
         job.strategy === 'JIT_PUBLISH'
       ) {
         this.db.updateJob(job.id, { status: 'PREWARMING' });
@@ -555,6 +652,27 @@ export class SchedulerEngine {
       if (isDueToPublish) {
         this.db.updateJob(job.id, { status: 'PUBLISHING' });
         const pubRes = await adapter.publishNow(ctx);
+        if (pubRes.inboxDraft) {
+          this.db.addJobLog(
+            job.id,
+            'WARN',
+            'TIKTOK_INBOX_DRAFT_READY',
+            'ส่งคลิปเข้า TikTok App Inbox (Draft) สำเร็จ — กรุณาเปิดแอป TikTok บนมือถือเพื่อกดเผยแพร่สาธารณะ',
+            { externalPostId: pubRes.externalPostId, externalUrl: pubRes.externalUrl }
+          );
+          return this.db.updateJob(job.id, {
+            status: 'PUBLISHED',
+            externalPostId: pubRes.externalPostId,
+            externalUrl: pubRes.externalUrl,
+            metadataSnapshot: {
+              ...job.metadataSnapshot,
+              __tiktokInboxDraft: true,
+            },
+            lockedUntil: null,
+            lastError: 'ส่งเข้า TikTok App Inbox (Draft) แล้ว — กดเผยแพร่ต่อในแอป TikTok',
+            nextRetryAt: null,
+          })!;
+        }
         this.db.addJobLog(
           job.id,
           'INFO',

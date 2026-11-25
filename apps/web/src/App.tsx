@@ -129,6 +129,7 @@ export function App() {
             dateStr: res.content.targetDate,
             file: null,
             prefill: {
+              draftContentId: res.content.id,
               asset: res.content.mediaAsset,
               brief: res.content.masterBrief,
               metadata: res.content.platformMetadata,

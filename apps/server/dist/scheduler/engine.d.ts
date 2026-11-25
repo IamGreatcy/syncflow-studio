@@ -14,11 +14,21 @@ export declare class SchedulerEngine {
     readonly liveFacebookReelsEnabled: boolean;
     private timer;
     private tokenTimer;
+    private maintenanceTimer;
     private isTickRunning;
+    private currentTickPromise;
+    private readonly tokenRefreshLocks;
     lastTickAt: string | null;
+    lastBackupAt: string | null;
     constructor(db: ClipFlowDb, storage: StorageService, liveFacebookReelsEnabled?: boolean);
     start(intervalMs?: number): void;
     stop(): void;
+    stopAndDrain(timeoutMs?: number): Promise<void>;
+    runDailyMaintenance(retentionDays?: number): Promise<{
+        backupKey: string | null;
+        prunedCoverCache: number;
+        reclaimedMediaAssets: number;
+    }>;
     nudge(): void;
     tick(now?: Date): Promise<{
         processed: number;
@@ -32,6 +42,7 @@ export declare class SchedulerEngine {
     private requireFacebookReelOwner;
     rescheduleJobExternal(jobId: string, newScheduledAtIso: string, newPrewarmAtIso: string | null, newStrategy: PublishStrategy): Promise<PublishJob>;
     cancelJob(jobId: string): Promise<PublishJob>;
+    refreshAccountTokenLocked(accountId: string, maxRemainingMs?: number, now?: Date): Promise<boolean>;
     refreshExpiringTokens(now?: Date): Promise<number>;
     private buildContext;
     private executeClaimedJob;
