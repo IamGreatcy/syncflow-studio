@@ -1,5 +1,6 @@
 import { type ContentFormat, type MasterBrief, type MediaProbeInfo, type MetadataTemplate, type PlatformMetadataMap } from '@clipflow/shared';
 import type { AppSettingsFull } from '../db/database.js';
+export declare function inferYouTubeCategoryId(brief: MasterBrief, tpl?: MetadataTemplate): string;
 export declare function generateMetadataDeterministic(params: {
     brief: MasterBrief;
     formats: ContentFormat[];

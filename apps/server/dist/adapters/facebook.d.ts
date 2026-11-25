@@ -22,8 +22,8 @@ export declare class FacebookAdapter implements PlatformAdapter {
         credentials?: OAuthAppCredentials;
     }): Promise<OAuthTokenResponse>;
     preUploadSchedule(ctx: AdapterContext): Promise<PreUploadResult>;
-    private uploadFacebookReel;
     private uploadFacebookPageVideo;
+    private uploadFacebookThumbnail;
     publishNow(ctx: AdapterContext): Promise<PublishResult>;
     updateSchedule(params: {
         ctx: AdapterContext;

@@ -183,7 +183,25 @@ export class YouTubeAdapter implements PlatformAdapter {
       throw new Error('ไม่มี YouTube Access Token กรุณาเชื่อมต่อ OAuth ก่อน');
     }
 
-    const stat = await fs.promises.stat(ctx.localFilePath);
+    let uploadFilePath = ctx.localFilePath;
+    let usedCoverFrame = false;
+    if (
+      ctx.job.format === 'YOUTUBE_SHORTS' &&
+      ctx.hasCustomCover &&
+      ctx.getCoverVideoPath
+    ) {
+      uploadFilePath = await ctx.getCoverVideoPath();
+      usedCoverFrame = uploadFilePath !== ctx.localFilePath;
+      if (usedCoverFrame) {
+        ctx.log(
+          'INFO',
+          'YT_SHORTS_COVER_FRAME_INJECTED',
+          'ฝังเฟรมหน้าปก (0.15 วินาที) ลงต้นคลิป YouTube Shorts ก่อนอัปโหลด'
+        );
+      }
+    }
+
+    const stat = await fs.promises.stat(uploadFilePath);
     const bodyPayload: Record<string, unknown> = {
       snippet: {
         title: meta.title,
@@ -231,11 +249,12 @@ export class YouTubeAdapter implements PlatformAdapter {
 
     ctx.log('INFO', 'YT_UPLOADING_CHUNKS', 'กำลังส่งไฟล์วิดีโอแบบ Resumable Chunks', {
       fileSizeBytes: stat.size,
+      usedCoverFrame,
     });
 
     const videoId = await this.uploadFileInChunks(
       uploadUrl,
-      ctx.localFilePath,
+      uploadFilePath,
       stat.size,
       ctx.asset.mimeType || 'video/mp4'
     );
@@ -259,9 +278,18 @@ export class YouTubeAdapter implements PlatformAdapter {
         }
         ctx.log('INFO', 'YT_THUMBNAIL_SET', 'อัปโหลดภาพปกคลิปสำเร็จ');
       } catch (err) {
-        ctx.log('WARN', 'YT_THUMBNAIL_WARN', 'ไม่สามารถอัปโหลดภาพปกได้ (ช่องอาจยังไม่ได้ยืนยันเบอร์โทร)', {
-          error: err instanceof Error ? err.message : String(err),
-        });
+        const msg = err instanceof Error ? err.message : String(err);
+        const isUnverified = /403|forbidden|permissions/i.test(msg);
+        ctx.log(
+          'WARN',
+          'YT_THUMBNAIL_WARN',
+          isUnverified
+            ? usedCoverFrame
+              ? 'YouTube ปฏิเสธ thumbnails/set (HTTP 403 — ช่องยังไม่ได้ยืนยันเบอร์ที่ https://www.youtube.com/verify) แต่ระบบฝังเฟรมหน้าปก 0.15s ในต้นคลิป Shorts ไว้ให้แล้ว'
+              : 'ไม่สามารถอัปโหลดภาพปกได้ — ช่องยังไม่ได้เปิดยืนยันสิทธิ์ที่ https://www.youtube.com/verify (HTTP 403)'
+            : 'ไม่สามารถอัปโหลดภาพปกได้',
+          { error: msg }
+        );
       }
     }
 

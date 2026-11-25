@@ -10,6 +10,7 @@ import type {
   ConnectionMode,
   ContentFormat,
   ContentItem,
+  FacebookReelPublication,
   JobLog,
   JobStatus,
   MasterBrief,
@@ -76,6 +77,8 @@ export interface AppSettingsFull {
   tiktokClientKey: string;
   tiktokClientSecret: string;
 }
+
+export class FacebookReelDuplicateError extends Error {}
 
 export class ClipFlowDb {
   readonly sqlite: DatabaseSync;
@@ -349,6 +352,62 @@ export class ClipFlowDb {
     if (!cols.includes('source_meta_json')) {
       this.sqlite.exec('ALTER TABLE media_assets ADD COLUMN source_meta_json TEXT;');
     }
+
+    const jobColumns = this.sqlite.prepare('PRAGMA table_info(publish_jobs)').all();
+    if (!jobColumns.some((column) => column.name === 'facebook_reel_json')) {
+      this.sqlite.exec('ALTER TABLE publish_jobs ADD COLUMN facebook_reel_json TEXT;');
+    }
+    // Old live Reel rows used the Video ID as the Post ID and treated a due
+    // schedule or a successful POST as publication. Reconcile by GET only.
+    const legacyReels = this.sqlite.prepare(
+      `SELECT j.id, j.external_post_id, j.content_item_id, a.external_account_id
+       FROM publish_jobs j JOIN social_accounts a ON a.id = j.social_account_id
+       WHERE j.format = 'FACEBOOK_REELS' AND a.connection_mode = 'LIVE_OFFICIAL'
+         AND j.facebook_reel_json IS NULL
+         AND (j.external_post_id IS NOT NULL OR j.status IN ('PREUPLOADING', 'PUBLISHING', 'PUBLISHED', 'FAILED')
+              OR j.retry_count > 0)
+         AND j.status != 'CANCELLED'`
+    ).all();
+    const migrateReel = this.sqlite.prepare(
+      `UPDATE publish_jobs SET facebook_reel_json = ?, status = ?, external_post_id = NULL,
+         external_url = NULL, next_retry_at = NULL, locked_until = NULL, last_error = ?
+       WHERE id = ? AND facebook_reel_json IS NULL`
+    );
+    for (const row of legacyReels) {
+      const videoId = /^\d+$/.test(String(row.external_post_id)) ? String(row.external_post_id) : undefined;
+      const status = videoId ? 'PUBLISH_REQUESTED' : 'UNKNOWN';
+      const receipt: FacebookReelPublication = {
+        graphVersion: 'v22.0', pageId: String(row.external_account_id), legacy: true, videoId,
+      };
+      const note = videoId ? null : 'Legacy Facebook Reel has no recorded Video ID. Check the Page before creating another job.';
+      migrateReel.run(JSON.stringify(receipt), status, note, String(row.id));
+      this.recomputeContentStatus(String(row.content_item_id));
+    }
+
+    // Auto-heal LIVE_OFFICIAL accounts whose account_name still carries the seed "(Simulation)" suffix
+    const simNamedLiveRows = plainList<Record<string, unknown>>(
+      this.sqlite
+        .prepare(
+          `SELECT id, platform, account_name, creator_info_json
+           FROM social_accounts
+           WHERE connection_mode = 'LIVE_OFFICIAL' AND account_name LIKE '%Simulation%'`
+        )
+        .all()
+    );
+    for (const r of simNamedLiveRows) {
+      const info = parseJson<TikTokCreatorInfo | null>(r.creator_info_json, null);
+      const nick = info?.creatorNickname?.trim();
+      const user = info?.creatorUsername?.trim().replace(/^@/, '');
+      const healedName =
+        nick && user && nick.toLowerCase() !== user.toLowerCase()
+          ? `${nick} (@${user})`
+          : nick || (user ? `@${user}` : String(r.account_name).replace(/\s*\(Simulation\)/i, '').trim());
+      if (healedName && healedName !== String(r.account_name)) {
+        this.sqlite
+          .prepare('UPDATE social_accounts SET account_name = ? WHERE id = ?')
+          .run(healedName, String(r.id));
+      }
+    }
   }
 
   // ---------- Channels ----------
@@ -574,6 +633,26 @@ export class ClipFlowDb {
     const cur = this.mapAccount(row);
     const now = new Date().toISOString();
 
+    const effectiveMode = patch.connectionMode ?? cur.connectionMode;
+    const effectiveCreatorInfo =
+      patch.creatorInfo !== undefined ? patch.creatorInfo : cur.creatorInfo;
+    let resolvedAccountName = patch.accountName ?? cur.accountName;
+    if (
+      effectiveMode === 'LIVE_OFFICIAL' &&
+      /simulation/i.test(resolvedAccountName) &&
+      effectiveCreatorInfo
+    ) {
+      const nick = effectiveCreatorInfo.creatorNickname?.trim();
+      const user = effectiveCreatorInfo.creatorUsername?.trim().replace(/^@/, '');
+      if (nick && user && nick.toLowerCase() !== user.toLowerCase()) {
+        resolvedAccountName = `${nick} (@${user})`;
+      } else if (nick) {
+        resolvedAccountName = nick;
+      } else if (user) {
+        resolvedAccountName = `@${user}`;
+      }
+    }
+
     const encAccess =
       patch.accessToken !== undefined
         ? this.cipher.encrypt(patch.accessToken)
@@ -592,9 +671,9 @@ export class ClipFlowDb {
          WHERE id = ?`
       )
       .run(
-        patch.accountName ?? cur.accountName,
+        resolvedAccountName,
         patch.externalAccountId ?? cur.externalAccountId,
-        patch.connectionMode ?? cur.connectionMode,
+        effectiveMode,
         JSON.stringify(patch.config ?? cur.config),
         encAccess,
         encRefresh,
@@ -1039,6 +1118,39 @@ export class ClipFlowDb {
 
     this.sqlite.exec('BEGIN IMMEDIATE;');
     try {
+      for (const target of input.jobs) {
+        if (target.format !== 'FACEBOOK_REELS') continue;
+        const account = this.getAccount(target.socialAccountId);
+        if (account?.connectionMode !== 'LIVE_OFFICIAL') continue;
+        const duplicate = this.sqlite.prepare(
+          `SELECT j.id FROM publish_jobs j
+           JOIN content_items c ON c.id = j.content_item_id
+           JOIN social_accounts a ON a.id = j.social_account_id
+           JOIN media_assets existing_asset ON existing_asset.id = c.media_asset_id
+           JOIN media_assets requested_asset ON requested_asset.id = ?
+           WHERE a.platform = 'FACEBOOK'
+             AND (
+               existing_asset.id = requested_asset.id OR (
+                 json_extract(existing_asset.source_meta_json, '$.sourceApp') = 'SyncCut Studio'
+                 AND json_extract(requested_asset.source_meta_json, '$.sourceApp') = 'SyncCut Studio'
+                 AND json_extract(existing_asset.source_meta_json, '$.episodeId') =
+                       json_extract(requested_asset.source_meta_json, '$.episodeId')
+                 AND json_extract(existing_asset.source_meta_json, '$.exportId') =
+                       json_extract(requested_asset.source_meta_json, '$.exportId')
+                 AND json_extract(existing_asset.source_meta_json, '$.exportId') != ''
+               )
+             )
+             AND (a.id = ? OR a.external_account_id = ? OR json_extract(j.facebook_reel_json, '$.pageId') = ?)
+             AND j.format = 'FACEBOOK_REELS' AND j.status != 'CANCELLED'
+             AND (j.facebook_reel_json IS NOT NULL OR a.connection_mode = 'LIVE_OFFICIAL')
+             AND (
+               julianday(j.scheduled_at) = julianday(?)
+               OR j.status IN ('NATIVE_SCHEDULED', 'PREUPLOADING', 'UPLOADED', 'PROCESSING', 'PUBLISH_REQUESTED', 'UNKNOWN')
+             )
+           LIMIT 1`
+        ).get(input.mediaAssetId, account.id, account.externalAccountId, account.externalAccountId, target.scheduledAt);
+        if (duplicate) throw new FacebookReelDuplicateError('มีงาน Facebook Reel สำหรับคลิปและเพจนี้อยู่แล้ว ตรวจสอบคิวเดิมก่อน');
+      }
       this.sqlite
         .prepare(
           `INSERT INTO content_items (
@@ -1211,9 +1323,17 @@ export class ClipFlowDb {
     const rows = plainList<Record<string, unknown>>(
       this.sqlite
         .prepare(
-          `SELECT j.*, a.account_name, a.connection_mode
+          `SELECT j.*, a.account_name, a.connection_mode,
+                  c.target_date AS content_target_date,
+                  c.master_brief_json AS content_master_brief_json,
+                  c.media_asset_id AS content_media_asset_id,
+                  m.original_filename AS media_original_filename,
+                  m.custom_cover_key AS media_custom_cover_key,
+                  m.thumbnail_paths_json AS media_thumbnail_paths_json
            FROM publish_jobs j
            LEFT JOIN social_accounts a ON a.id = j.social_account_id
+           LEFT JOIN content_items c ON c.id = j.content_item_id
+           LEFT JOIN media_assets m ON m.id = c.media_asset_id
            ${where}
            ORDER BY j.scheduled_at ASC`
         )
@@ -1226,9 +1346,17 @@ export class ClipFlowDb {
     const row = plain<Record<string, unknown>>(
       this.sqlite
         .prepare(
-          `SELECT j.*, a.account_name, a.connection_mode
+          `SELECT j.*, a.account_name, a.connection_mode,
+                  c.target_date AS content_target_date,
+                  c.master_brief_json AS content_master_brief_json,
+                  c.media_asset_id AS content_media_asset_id,
+                  m.original_filename AS media_original_filename,
+                  m.custom_cover_key AS media_custom_cover_key,
+                  m.thumbnail_paths_json AS media_thumbnail_paths_json
            FROM publish_jobs j
            LEFT JOIN social_accounts a ON a.id = j.social_account_id
+           LEFT JOIN content_items c ON c.id = j.content_item_id
+           LEFT JOIN media_assets m ON m.id = c.media_asset_id
            WHERE j.id = ?`
         )
         .get(id)
@@ -1239,7 +1367,7 @@ export class ClipFlowDb {
   /**
    * Atomically claims due jobs using BEGIN IMMEDIATE so concurrent ticks never duplicate work.
    */
-  claimDueJobs(nowIso: string, limit = 10): PublishJob[] {
+  claimDueJobs(nowIso: string, limit = 10, allowLiveFacebookReels = true): PublishJob[] {
     const leaseUntil = new Date(
       new Date(nowIso).getTime() + 5 * 60_000
     ).toISOString();
@@ -1252,16 +1380,24 @@ export class ClipFlowDb {
             `SELECT * FROM publish_jobs
              WHERE (locked_until IS NULL OR locked_until < ?)
                AND (next_retry_at IS NULL OR next_retry_at <= ?)
+               AND (? = 1 OR format != 'FACEBOOK_REELS' OR (
+                 facebook_reel_json IS NULL AND NOT EXISTS (
+                   SELECT 1 FROM social_accounts a WHERE a.id = publish_jobs.social_account_id
+                     AND a.connection_mode = 'LIVE_OFFICIAL'
+                 )
+               ))
                AND (
                  (status = 'QUEUED' AND strategy IN ('NATIVE_PREUPLOAD', 'INBOX_DRAFT'))
                  OR (status = 'QUEUED' AND strategy = 'JIT_PUBLISH' AND (prewarm_at IS NULL OR prewarm_at <= ?))
                  OR (status = 'READY_TO_PUBLISH' AND scheduled_at <= ?)
                  OR (status = 'NATIVE_SCHEDULED' AND scheduled_at <= ?)
+                 OR (format = 'FACEBOOK_REELS' AND facebook_reel_json IS NOT NULL
+                     AND status IN ('PREUPLOADING', 'UPLOADED', 'PROCESSING', 'PUBLISH_REQUESTED'))
                )
              ORDER BY scheduled_at ASC
              LIMIT ?`
           )
-          .all(nowIso, nowIso, nowIso, nowIso, nowIso, limit)
+          .all(nowIso, nowIso, Number(allowLiveFacebookReels), nowIso, nowIso, nowIso, limit)
       );
 
       const claimed: PublishJob[] = [];
@@ -1283,6 +1419,16 @@ export class ClipFlowDb {
     }
   }
 
+  facebookReelRateLimitedUntil(pageId: string, nowIso: string): string | null {
+    const row = this.sqlite.prepare(
+      `SELECT MAX(json_extract(facebook_reel_json, '$.rateLimitedUntil')) AS until
+       FROM publish_jobs WHERE format = 'FACEBOOK_REELS' AND facebook_reel_json IS NOT NULL
+         AND json_extract(facebook_reel_json, '$.pageId') = ?
+         AND json_extract(facebook_reel_json, '$.rateLimitedUntil') > ?`
+    ).get(pageId, nowIso);
+    return typeof row?.until === 'string' ? row.until : null;
+  }
+
   claimSpecificJob(jobId: string, nowIso: string): PublishJob | null {
     const leaseUntil = new Date(
       new Date(nowIso).getTime() + 5 * 60_000
@@ -1292,9 +1438,11 @@ export class ClipFlowDb {
       const row = plain<Record<string, unknown>>(
         this.sqlite
           .prepare(
-            `SELECT * FROM publish_jobs WHERE id = ? AND (locked_until IS NULL OR locked_until < ?) AND status NOT IN ('PUBLISHED', 'CANCELLED')`
+            `SELECT * FROM publish_jobs WHERE id = ? AND (locked_until IS NULL OR locked_until < ?)
+             AND status != 'PUBLISHED'
+             AND (facebook_reel_json IS NULL OR next_retry_at IS NULL OR next_retry_at <= ?)`
           )
-          .get(jobId, nowIso)
+          .get(jobId, nowIso, nowIso)
       );
       if (!row) {
         this.sqlite.exec('COMMIT;');
@@ -1321,6 +1469,7 @@ export class ClipFlowDb {
       scheduledAt: string;
       prewarmAt: string | null;
       externalPostId: string | null;
+      facebookReel: FacebookReelPublication | null;
       externalContainerId: string | null;
       externalUrl: string | null;
       metadataSnapshot: Record<string, unknown>;
@@ -1328,20 +1477,21 @@ export class ClipFlowDb {
       nextRetryAt: string | null;
       lastError: string | null;
       lockedUntil: string | null;
-    }>
+    }>,
+    expectedLock?: string,
   ): PublishJob | null {
     const cur = this.getJob(id);
     if (!cur) return null;
     const now = new Date().toISOString();
 
-    this.sqlite
+    const result = this.sqlite
       .prepare(
         `UPDATE publish_jobs SET
           status = ?, strategy = ?, scheduled_at = ?, prewarm_at = ?,
           external_post_id = ?, external_container_id = ?, external_url = ?,
           metadata_snapshot_json = ?, retry_count = ?, next_retry_at = ?,
-          last_error = ?, locked_until = ?, updated_at = ?
-         WHERE id = ?`
+          last_error = ?, locked_until = ?, updated_at = ?, facebook_reel_json = ?
+         WHERE id = ? AND (? IS NULL OR locked_until = ?)`
       )
       .run(
         patch.status ?? cur.status,
@@ -1363,9 +1513,11 @@ export class ClipFlowDb {
         patch.lastError !== undefined ? patch.lastError : cur.lastError,
         patch.lockedUntil !== undefined ? patch.lockedUntil : cur.lockedUntil,
         now,
-        id
+        (patch.facebookReel ?? cur.facebookReel) ? JSON.stringify(patch.facebookReel ?? cur.facebookReel) : null,
+        id, expectedLock ?? null, expectedLock ?? null
       );
 
+    if (!result.changes) return null;
     this.recomputeContentStatus(cur.contentItemId);
     return this.getJob(id);
   }
@@ -1424,6 +1576,15 @@ export class ClipFlowDb {
   }
 
   private mapJob(r: Record<string, unknown>): PublishJob {
+    const brief = parseJson<Partial<MasterBrief>>(r.content_master_brief_json, {});
+    const thumbs = parseJson<string[]>(r.media_thumbnail_paths_json, []);
+    const fallbackFilename = r.media_original_filename
+      ? String(r.media_original_filename)
+      : undefined;
+    const topic =
+      (typeof brief.topic === 'string' && brief.topic.trim()) ||
+      (typeof brief.coverHeadline === 'string' && brief.coverHeadline.trim()) ||
+      fallbackFilename;
     return {
       id: String(r.id),
       idempotencyKey: String(r.idempotency_key),
@@ -1437,6 +1598,7 @@ export class ClipFlowDb {
       prewarmAt: r.prewarm_at ? String(r.prewarm_at) : null,
       status: r.status as JobStatus,
       externalPostId: r.external_post_id ? String(r.external_post_id) : null,
+      facebookReel: parseJson<FacebookReelPublication | null>(r.facebook_reel_json, null),
       externalContainerId: r.external_container_id
         ? String(r.external_container_id)
         : null,
@@ -1456,6 +1618,15 @@ export class ClipFlowDb {
       connectionMode: r.connection_mode
         ? (r.connection_mode as ConnectionMode)
         : undefined,
+      contentTopic: topic,
+      contentTargetDate: r.content_target_date
+        ? String(r.content_target_date)
+        : undefined,
+      mediaAssetId: r.content_media_asset_id
+        ? String(r.content_media_asset_id)
+        : undefined,
+      hasCustomCover: Boolean(r.media_custom_cover_key),
+      thumbnailFilename: thumbs[0] ?? null,
     };
   }
 

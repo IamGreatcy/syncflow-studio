@@ -132,4 +132,76 @@ describe('SyncCut Bridge Helpers & Metadata Extraction', () => {
       fs.rmSync(tmpDir, { recursive: true, force: true });
     }
   });
+
+  it('exempts stylized stickman3d animation from AI disclosure and sets YouTube Education category', () => {
+    const ep = {
+      id: 'ep-stickman',
+      title: 'ทำไมขอบเหรียญมีรอยหยัก? — คำตอบเกี่ยวกับ ไอแซก นิวตัน',
+      production: { visualStyle: 'stickman3d' },
+      shots: [{ id: 's1', narration: 'เหรียญถูกเล็ม ดูออกยังไง?', duration: 7 }],
+      delivery: { tags: '#ความรู้ #ประวัติศาสตร์' },
+    };
+    const brief = extractBriefFromSyncCutEpisode(ep, {
+      id: 'exp-2',
+      episodeId: 'ep-stickman',
+      technicalQA: { actual: { duration: 45 } },
+    });
+    assert.equal(brief.isSyntheticMedia, false);
+    assert.equal(brief.cta, '');
+
+    const generated = generateMetadataDeterministic({
+      brief,
+      formats: [...CONTENT_FORMATS],
+      templates: [],
+    });
+    assert.equal(generated.YOUTUBE_SHORTS?.categoryId, '27');
+    assert.equal(generated.YOUTUBE_SHORTS?.containsSyntheticMedia, false);
+    assert.equal(generated.TIKTOK?.isAigc, false);
+    assert.equal(generated.INSTAGRAM_REELS?.isAiGenerated, false);
+    assert.equal(generated.FACEBOOK_REELS?.isAiGenerated, false);
+    for (const fmt of CONTENT_FORMATS) {
+      const issues = validateFormatMetadata(
+        fmt,
+        generated[fmt] as Record<string, unknown>
+      );
+      assert.equal(
+        issues.length,
+        0,
+        `${fmt}: ${JSON.stringify(issues)}`
+      );
+    }
+  });
+
+  it('marks photoreal episodes as requiring AI disclosure across all 4 platforms', () => {
+    const ep = {
+      id: 'ep-photoreal',
+      title: 'จำลองเหตุการณ์ภูเขาไฟปะทุ',
+      production: { visualStyle: 'photoreal' },
+      shots: [{ id: 's1', narration: 'แรงสั่นสะเทือนใต้พิภพ', duration: 8 }],
+      delivery: { tags: '#สารคดี #วิทยาศาสตร์' },
+    };
+    const brief = extractBriefFromSyncCutEpisode(ep);
+    assert.equal(brief.isSyntheticMedia, true);
+
+    const generated = generateMetadataDeterministic({
+      brief,
+      formats: [...CONTENT_FORMATS],
+      templates: [],
+    });
+    assert.equal(generated.YOUTUBE_SHORTS?.containsSyntheticMedia, true);
+    assert.equal(generated.TIKTOK?.isAigc, true);
+    assert.equal(generated.INSTAGRAM_REELS?.isAiGenerated, true);
+    assert.equal(generated.FACEBOOK_REELS?.isAiGenerated, true);
+  });
+
+  it('flags hashtag stuffing, cross-platform tag leaks, and spam tags with warnings', () => {
+    const ttIssues = validateFormatMetadata('TIKTOK', {
+      caption: 'ทดสอบ #Shorts #fyp #one #two #three #four',
+      privacyLevel: 'PUBLIC_TO_EVERYONE',
+    });
+    const codes = new Set(ttIssues.map((i) => i.code));
+    assert.ok(codes.has('HASHTAG_STUFFING_RISK'));
+    assert.ok(codes.has('CROSS_PLATFORM_TAG_LEAK'));
+    assert.ok(codes.has('SPAM_HASHTAG_RISK'));
+  });
 });

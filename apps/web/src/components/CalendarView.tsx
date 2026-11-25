@@ -501,17 +501,16 @@ export function CalendarView({
                         </span>
                       )}
 
-                      {job.status !== 'PUBLISHED' &&
-                        job.status !== 'CANCELLED' && (
-                          <button
-                            type="button"
-                            onClick={() => void onRunJobNow(job.id)}
-                            className="inline-flex items-center gap-1 rounded-full bg-apple-grouped px-2.5 py-1 text-[11px] font-semibold text-apple-blue hover:bg-apple-hover"
-                          >
-                            <Play className="h-3 w-3" />
-                            โพสต์ทันที
-                          </button>
-                        )}
+                      {job.status !== 'PUBLISHED' && (
+                        <button
+                          type="button"
+                          onClick={() => void onRunJobNow(job.id)}
+                          className="inline-flex items-center gap-1 rounded-full bg-apple-grouped px-2.5 py-1 text-[11px] font-semibold text-apple-blue hover:bg-apple-hover"
+                        >
+                          <Play className="h-3 w-3" />
+                          โพสต์ทันที
+                        </button>
+                      )}
                     </div>
 
                     {job.lastError && (

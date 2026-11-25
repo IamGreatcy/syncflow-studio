@@ -767,7 +767,7 @@ export function ContentPlannerModal({
                               : 'ยังไม่มีหน้าปกกำหนดเอง'}
                           </p>
                           <p className="text-[10.5px] text-apple-secondary">
-                            ใช้กับ YouTube / Facebook / IG Cover URL
+                            แนบอัตโนมัติทุกแพลตฟอร์ม: YouTube / FB Reels / IG (Cover URL) / TikTok & Shorts (เฟรมปก 0.15s)
                           </p>
                         </div>
                       </div>
@@ -1536,6 +1536,29 @@ function YouTubeEditor({
             className="apple-input"
           />
         </InsetRow>
+        <InsetRow className="space-y-1">
+          <label className="text-[12px] font-medium text-apple-secondary">
+            หมวดหมู่คลิป (YouTube Category — จับคู่กลุ่มผู้ชมเริ่มต้น)
+          </label>
+          <select
+            value={meta.categoryId || '22'}
+            onChange={(e) => onChange({ categoryId: e.target.value })}
+            className="apple-input"
+          >
+            <option value="27">
+              27 · การศึกษา &amp; ความรู้ (Education — แนะนำสายเกร็ดความรู้/ประวัติศาสตร์)
+            </option>
+            <option value="24">
+              24 · บันเทิง &amp; เรื่องเล่า (Entertainment)
+            </option>
+            <option value="28">
+              28 · วิทยาศาสตร์ &amp; เทคโนโลยี (Science &amp; Tech)
+            </option>
+            <option value="22">22 · ผู้คน &amp; บล็อก (People &amp; Blogs)</option>
+            <option value="1">1 · ภาพยนตร์ &amp; แอนิเมชัน (Film &amp; Animation)</option>
+            <option value="25">25 · ข่าว &amp; การเมือง (News &amp; Politics)</option>
+          </select>
+        </InsetRow>
         <InsetRow className="flex items-center justify-between">
           <span className="text-[13px] text-apple-label">
             แจ้งเตือนผู้ติดตาม (Notify Subscribers)
@@ -1554,10 +1577,15 @@ function YouTubeEditor({
             onChange={(v) => onChange({ madeForKids: v })}
           />
         </InsetRow>
-        <InsetRow className="flex items-center justify-between">
-          <span className="text-[13px] text-apple-label">
-            เนื้อหาสร้าง/ดัดแปลงด้วย AI (Synthetic Media)
-          </span>
+        <InsetRow className="flex items-center justify-between gap-3">
+          <div>
+            <span className="text-[13px] text-apple-label">
+              เนื้อหาสร้าง/ดัดแปลงด้วย AI (Synthetic Media)
+            </span>
+            <p className="text-[11px] text-apple-tertiary">
+              เปิดเฉพาะภาพ/บุคคลจำลองสมจริง (แอนิเมชัน 2D/Stickman ยกเว้นไม่ต้องเปิด)
+            </p>
+          </div>
           <AppleSwitch
             checked={Boolean(meta.containsSyntheticMedia)}
             onChange={(v) => onChange({ containsSyntheticMedia: v })}
@@ -1679,10 +1707,15 @@ function TikTokEditor({
             onChange={(v) => onChange({ brandContentToggle: v })}
           />
         </InsetRow>
-        <InsetRow className="flex items-center justify-between">
-          <span className="text-[13px] text-apple-label">
-            สร้างด้วย AI (AIGC)
-          </span>
+        <InsetRow className="flex items-center justify-between gap-3">
+          <div>
+            <span className="text-[13px] text-apple-label">
+              สร้างด้วย AI (AIGC)
+            </span>
+            <p className="text-[11px] text-apple-tertiary">
+              เปิดเฉพาะภาพ/บุคคลจำลองสมจริง (แอนิเมชัน 2D/Stickman ยกเว้นไม่ต้องเปิด)
+            </p>
+          </div>
           <AppleSwitch
             checked={meta.isAigc}
             onChange={(v) => onChange({ isAigc: v })}
@@ -1734,10 +1767,15 @@ function InstagramEditor({
           onChange={(v) => onChange({ shareToFeed: v })}
         />
       </InsetRow>
-      <InsetRow className="flex items-center justify-between">
-        <span className="text-[13px] text-apple-label">
-          สร้างด้วย AI (AI Info / is_ai_generated)
-        </span>
+      <InsetRow className="flex items-center justify-between gap-3">
+        <div>
+          <span className="text-[13px] text-apple-label">
+            สร้างด้วย AI (AI Info / is_ai_generated)
+          </span>
+          <p className="text-[11px] text-apple-tertiary">
+            เปิดเฉพาะภาพ/บุคคลจำลองสมจริง (แอนิเมชัน 2D/Stickman ยกเว้นไม่ต้องเปิด)
+          </p>
+        </div>
         <AppleSwitch
           checked={Boolean(meta.isAiGenerated)}
           onChange={(v) => onChange({ isAiGenerated: v })}
@@ -1801,10 +1839,15 @@ function FacebookEditor({
           className="apple-input"
         />
       </InsetRow>
-      <InsetRow className="flex items-center justify-between">
-        <span className="text-[13px] text-apple-label">
-          สร้างด้วย AI (AI Info / is_ai_generated)
-        </span>
+      <InsetRow className="flex items-center justify-between gap-3">
+        <div>
+          <span className="text-[13px] text-apple-label">
+            สร้างด้วย AI (AI Info / is_ai_generated)
+          </span>
+          <p className="text-[11px] text-apple-tertiary">
+            เปิดเฉพาะภาพ/บุคคลจำลองสมจริง (แอนิเมชัน 2D/Stickman ยกเว้นไม่ต้องเปิด)
+          </p>
+        </div>
         <AppleSwitch
           checked={Boolean(meta.isAiGenerated)}
           onChange={(v) => onChange({ isAiGenerated: v })}

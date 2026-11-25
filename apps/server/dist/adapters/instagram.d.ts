@@ -13,6 +13,7 @@ export declare class InstagramAdapter implements PlatformAdapter {
         credentials?: OAuthAppCredentials;
     }): Promise<OAuthTokenResponse>;
     preWarm(ctx: AdapterContext): Promise<PreWarmResult>;
+    private createAndWaitContainer;
     publishNow(ctx: AdapterContext): Promise<PublishResult>;
 }
 //# sourceMappingURL=instagram.d.ts.map

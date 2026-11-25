@@ -64,6 +64,15 @@ export function addDaysToDateStr(dateStr, days) {
     return dt.toISOString().slice(0, 10);
 }
 /**
+ * Returns today's or next day's YYYY-MM-DD in the channel's local IANA timezone (avoids UTC off-by-1).
+ */
+export function getLocalTodayDateStr(timezone = 'Asia/Bangkok', now = new Date()) {
+    return getLocalDateTimeParts(now, timezone).dateStr;
+}
+export function getNextDayDateStr(timezone = 'Asia/Bangkok', now = new Date()) {
+    return addDaysToDateStr(getLocalTodayDateStr(timezone, now), 1);
+}
+/**
  * Formats a Date into { dateStr: "YYYY-MM-DD", localTime: "HH:mm" } in the given IANA timezone.
  */
 export function getLocalDateTimeParts(date, timezone = 'Asia/Bangkok') {

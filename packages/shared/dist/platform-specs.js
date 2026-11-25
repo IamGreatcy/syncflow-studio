@@ -108,6 +108,30 @@ export const PLATFORM_LIMITS = {
         preferredAspect: 'ANY',
     },
 };
+export const STYLIZED_ANIMATION_VISUAL_STYLES = new Set([
+    'stickman3d',
+    'illustration',
+    'explainer3d',
+    'motion',
+    'handmade',
+    'abstract',
+    'cartoon',
+    '2d',
+    'anime',
+]);
+/**
+ * Per 2025-2026 YouTube Altered/Synthetic, TikTok AIGC, and Meta AI Info rules:
+ * Clearly stylized/cartoon/2D animation is exempt from realistic-AI disclosure labels,
+ * whereas photorealistic or unspecified synthetic media requires disclosure.
+ */
+export function requiresRealisticAiDisclosure(visualStyle, fallback = true) {
+    const norm = (visualStyle || '').trim().toLowerCase();
+    if (!norm)
+        return fallback;
+    if (STYLIZED_ANIMATION_VISUAL_STYLES.has(norm))
+        return false;
+    return true;
+}
 export function formatToPlatform(format) {
     return PLATFORM_LIMITS[format].platform;
 }
@@ -476,6 +500,51 @@ export function validateFormatMetadata(format, meta, probe) {
             });
         }
     }
+    // Non-blocking anti-suppression & anti-spam checks (2026 platform trust signals)
+    const checkAntiSuppressionTags = (field, tagSourceText, fullSearchText) => {
+        const tagCount = extractHashtags(tagSourceText).length;
+        if (tagCount > 5) {
+            issues.push({
+                format,
+                field,
+                severity: 'warning',
+                code: 'HASHTAG_STUFFING_RISK',
+                message: `ใส่ Hashtags มากเกินไป (${tagCount} แท็ก · แนะนำ 2–4 แท็กเฉพาะทาง) อาจถูกลดการมองเห็นเป็นสแปม`,
+            });
+        }
+        const crossLeak = format === 'YOUTUBE_SHORTS' || format === 'YOUTUBE_LONG'
+            ? /#(?:tiktok|tiktokthailand|reels|reelsinstagram|facebookreels)\b/i.test(fullSearchText)
+            : /#shorts\b/i.test(fullSearchText);
+        if (crossLeak) {
+            issues.push({
+                format,
+                field,
+                severity: 'warning',
+                code: 'CROSS_PLATFORM_TAG_LEAK',
+                message: `พบ Hashtag ข้ามแพลตฟอร์มใน ${spec.labelTh} (เช่น #Shorts บน TikTok/Reels หรือ #tiktok บน YouTube)`,
+            });
+        }
+        if (/#(?:fyp|foryou|foryoupage|viral)\b/i.test(fullSearchText)) {
+            issues.push({
+                format,
+                field,
+                severity: 'warning',
+                code: 'SPAM_HASHTAG_RISK',
+                message: 'หลีกเลี่ยงแท็กกว้างอย่าง #fyp / #foryou / #viral ควรใช้คีย์เวิร์ดเฉพาะหัวข้อแทน',
+            });
+        }
+    };
+    if (format === 'YOUTUBE_SHORTS' || format === 'YOUTUBE_LONG') {
+        checkAntiSuppressionTags('description', String(meta.description ?? ''), `${String(meta.title ?? '')}\n${String(meta.description ?? '')}`);
+    }
+    else if (format === 'TIKTOK' || format === 'INSTAGRAM_REELS') {
+        const cap = String(meta.caption ?? '');
+        checkAntiSuppressionTags('caption', cap, cap);
+    }
+    else if (format === 'FACEBOOK_REELS' || format === 'FACEBOOK_VIDEO') {
+        const desc = String(meta.description ?? '');
+        checkAntiSuppressionTags('description', desc, `${String(meta.title ?? '')}\n${desc}`);
+    }
     return issues;
 }
 /**
@@ -502,6 +571,9 @@ export function computeTikTokChunkPlan(videoSizeBytes, preferredChunkBytes = 10_
         };
     }
     let chunkSize = Math.min(Math.max(preferredChunkBytes, MIN_CHUNK), MAX_CHUNK);
+    if (videoSizeBytes > MAX_CHUNK && Math.floor(videoSizeBytes / chunkSize) < 2) {
+        chunkSize = Math.max(MIN_CHUNK, Math.min(MAX_CHUNK, Math.floor(videoSizeBytes / 2)));
+    }
     // Ensure chunk count <= 1000
     if (Math.floor(videoSizeBytes / chunkSize) > MAX_CHUNKS) {
         chunkSize = Math.min(MAX_CHUNK, Math.ceil(videoSizeBytes / MAX_CHUNKS));
@@ -517,6 +589,10 @@ export function computeTikTokChunkPlan(videoSizeBytes, preferredChunkBytes = 10_
         totalChunkCount = Math.floor(videoSizeBytes / chunkSize);
         finalStart = (totalChunkCount - 1) * chunkSize;
         finalSize = videoSizeBytes - finalStart;
+    }
+    // TikTok requires single-chunk uploads (<= 64 MB) to declare chunk_size === video_size
+    if (totalChunkCount === 1) {
+        chunkSize = videoSizeBytes;
     }
     const chunks = [];
     for (let i = 0; i < totalChunkCount; i++) {

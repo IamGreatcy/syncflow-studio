@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import { randomBytes } from 'node:crypto';
 import {
   computeTikTokChunkPlan,
+  type TikTokChunkPlan,
   type TikTokCreatorInfo,
   type TikTokMetadata,
 } from '@clipflow/shared';
@@ -13,6 +14,22 @@ import type {
   PreUploadResult,
   PublishResult,
 } from './types.js';
+import { fetchWithRetry } from '../services/net-resilience.js';
+
+export function formatTikTokAccountDisplayName(
+  info?: TikTokCreatorInfo | null,
+  fallback?: string
+): string {
+  const nick = info?.creatorNickname?.trim();
+  const user = info?.creatorUsername?.trim().replace(/^@/, '');
+  if (nick && user && nick.toLowerCase() !== user.toLowerCase()) {
+    return `${nick} (@${user})`;
+  }
+  if (nick) return nick;
+  if (user) return `@${user}`;
+  if (fallback && !/simulation/i.test(fallback)) return fallback;
+  return 'TikTok Official';
+}
 
 export class TikTokAdapter implements PlatformAdapter {
   readonly platform = 'TIKTOK' as const;
@@ -55,7 +72,7 @@ export class TikTokAdapter implements PlatformAdapter {
       throw new Error('TikTok Client Key หรือ Client Secret ไม่ครบ');
     }
 
-    const res = await fetch('https://open.tiktokapis.com/v2/oauth/token/', {
+    const res = await fetchWithRetry('https://open.tiktokapis.com/v2/oauth/token/', {
       method: 'POST',
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
       body: new URLSearchParams({
@@ -74,6 +91,13 @@ export class TikTokAdapter implements PlatformAdapter {
       open_id?: string;
     };
 
+    let creatorInfo: TikTokCreatorInfo | null = null;
+    try {
+      creatorInfo = await this.fetchCreatorInfo(data.access_token, false);
+    } catch {
+      // Allow OAuth completion even if creator_info endpoint is temporarily unavailable
+    }
+
     return {
       accessToken: data.access_token,
       refreshToken: data.refresh_token ?? null,
@@ -81,6 +105,8 @@ export class TikTokAdapter implements PlatformAdapter {
         ? new Date(Date.now() + data.expires_in * 1000).toISOString()
         : null,
       externalAccountId: data.open_id ?? '',
+      accountName: formatTikTokAccountDisplayName(creatorInfo),
+      creatorInfo,
     };
   }
 
@@ -94,7 +120,7 @@ export class TikTokAdapter implements PlatformAdapter {
       credentials?.tiktokClientSecret ||
       process.env.TIKTOK_CLIENT_SECRET ||
       '';
-    const res = await fetch('https://open.tiktokapis.com/v2/oauth/token/', {
+    const res = await fetchWithRetry('https://open.tiktokapis.com/v2/oauth/token/', {
       method: 'POST',
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
       body: new URLSearchParams({
@@ -140,7 +166,7 @@ export class TikTokAdapter implements PlatformAdapter {
       };
     }
 
-    const res = await fetch(
+    const res = await fetchWithRetry(
       'https://open.tiktokapis.com/v2/post/publish/creator_info/query/',
       {
         method: 'POST',
@@ -184,14 +210,18 @@ export class TikTokAdapter implements PlatformAdapter {
 
   async preUploadSchedule(ctx: AdapterContext): Promise<PreUploadResult> {
     // Used when TikTok account is configured in INBOX_DRAFT mode
-    const chunkPlan = computeTikTokChunkPlan(ctx.asset.fileSizeBytes);
     if (ctx.account.connectionMode === 'SIMULATION') {
+      const videoSizeBytes = this.resolveActualVideoSize(ctx);
+      const chunkPlan = computeTikTokChunkPlan(videoSizeBytes);
       const publishId = `tt_inbox_${randomBytes(5).toString('hex')}`;
       ctx.log(
         'INFO',
         'TIKTOK_INBOX_DRAFT',
         `[Simulation] ส่งคลิปเข้า TikTok Inbox Draft สำเร็จ (${chunkPlan.totalChunkCount} chunk(s), chunk_size=${chunkPlan.chunkSize})`,
-        { publishId }
+        {
+          publishId,
+          coverSource: ctx.hasCustomCover ? 'CUSTOM_COVER_FRAME_0' : 'VIDEO_TIMESTAMP',
+        }
       );
       return {
         externalPostId: publishId,
@@ -202,46 +232,32 @@ export class TikTokAdapter implements PlatformAdapter {
 
     if (!ctx.accessToken) throw new Error('Missing TikTok access token');
 
-    const initRes = await fetch(
-      'https://open.tiktokapis.com/v2/post/publish/inbox/video/init/',
-      {
-        method: 'POST',
-        headers: {
-          Authorization: `Bearer ${ctx.accessToken}`,
-          'Content-Type': 'application/json; charset=UTF-8',
-        },
-        body: JSON.stringify({
+    const { uploadFilePath, videoSizeBytes } = await this.resolveUploadMedia(ctx);
+    const { chunkPlan, publishId, uploadUrl } =
+      await this.initUploadWithChunkFallback({
+        endpoint: 'https://open.tiktokapis.com/v2/post/publish/inbox/video/init/',
+        accessToken: ctx.accessToken,
+        videoSizeBytes,
+        errorLabel: 'TikTok inbox init',
+        buildPayload: (plan) => ({
           source_info: {
             source: 'FILE_UPLOAD',
-            video_size: ctx.asset.fileSizeBytes,
-            chunk_size: chunkPlan.chunkSize,
-            total_chunk_count: chunkPlan.totalChunkCount,
+            video_size: videoSizeBytes,
+            chunk_size: plan.chunkSize,
+            total_chunk_count: plan.totalChunkCount,
           },
         }),
-      }
-    );
-    if (!initRes.ok) {
-      throw new Error(`TikTok inbox init failed: ${await initRes.text()}`);
-    }
-    const initJson = (await initRes.json()) as {
-      data?: { publish_id?: string; upload_url?: string };
-      error?: { code?: string; message?: string };
-    };
-    if (!initJson.data?.upload_url || !initJson.data.publish_id) {
-      throw new Error(
-        `TikTok inbox init invalid response: ${JSON.stringify(initJson)}`
-      );
-    }
+      });
 
     await this.uploadChunksSequential(
-      initJson.data.upload_url,
-      ctx.localFilePath,
-      ctx.asset.fileSizeBytes,
+      uploadUrl,
+      uploadFilePath,
+      videoSizeBytes,
       chunkPlan.chunks
     );
 
     return {
-      externalPostId: initJson.data.publish_id,
+      externalPostId: publishId,
       externalUrl: null,
       status: 'NATIVE_SCHEDULED',
     };
@@ -265,9 +281,10 @@ export class TikTokAdapter implements PlatformAdapter {
     }
 
     const meta = ctx.job.metadataSnapshot as unknown as TikTokMetadata;
-    const chunkPlan = computeTikTokChunkPlan(ctx.asset.fileSizeBytes);
 
     if (ctx.account.connectionMode === 'SIMULATION') {
+      const videoSizeBytes = this.resolveActualVideoSize(ctx);
+      const chunkPlan = computeTikTokChunkPlan(videoSizeBytes);
       const pubId = `tt_${randomBytes(5).toString('hex')}`;
       ctx.log(
         'INFO',
@@ -275,6 +292,7 @@ export class TikTokAdapter implements PlatformAdapter {
         `[Simulation] ยิง TikTok Direct Post สำเร็จ (floor chunk_count=${chunkPlan.totalChunkCount}, privacy=${meta.privacyLevel})`,
         {
           publishId: pubId,
+          coverSource: ctx.hasCustomCover ? 'CUSTOM_COVER_FRAME_0' : 'VIDEO_TIMESTAMP',
           allowComment: meta.allowComment,
           allowDuet: meta.allowDuet,
           allowStitch: meta.allowStitch,
@@ -291,75 +309,176 @@ export class TikTokAdapter implements PlatformAdapter {
 
     if (!ctx.accessToken) throw new Error('Missing TikTok access token');
 
-    // Step 1: Verify creator_info
-    const info = await this.fetchCreatorInfo(ctx.accessToken, false);
-    if (!info.privacyLevelOptions.includes(meta.privacyLevel)) {
-      throw new Error(
-        `Privacy level ${meta.privacyLevel} ไม่ได้รับอนุญาตสำหรับบัญชีนี้ (อนุญาต: ${info.privacyLevelOptions.join(', ')})`
-      );
-    }
-
-    // Step 2: Direct Post Init
-    const initRes = await fetch(
-      'https://open.tiktokapis.com/v2/post/publish/video/init/',
-      {
-        method: 'POST',
-        headers: {
-          Authorization: `Bearer ${ctx.accessToken}`,
-          'Content-Type': 'application/json; charset=UTF-8',
-        },
-        body: JSON.stringify({
-          post_info: {
-            title: meta.caption,
-            privacy_level: meta.privacyLevel,
-            disable_comment: !meta.allowComment || info.commentDisabled,
-            disable_duet: !meta.allowDuet || info.duetDisabled,
-            disable_stitch: !meta.allowStitch || info.stitchDisabled,
-            video_cover_timestamp_ms: meta.coverTimestampMs || 0,
-            brand_content_toggle: Boolean(meta.brandContentToggle),
-            brand_organic_toggle: Boolean(meta.brandOrganicToggle),
-            is_aigc: Boolean(meta.isAigc),
-          },
-          source_info: {
-            source: 'FILE_UPLOAD',
-            video_size: ctx.asset.fileSizeBytes,
-            chunk_size: chunkPlan.chunkSize,
-            total_chunk_count: chunkPlan.totalChunkCount,
-          },
-        }),
+    // Step 1: Verify creator_info & adjust privacy level if account switched to Private
+    let info: TikTokCreatorInfo;
+    try {
+      info = await this.fetchCreatorInfo(ctx.accessToken, false);
+    } catch (creatorErr) {
+      if (ctx.account.creatorInfo && ctx.account.creatorInfo.privacyLevelOptions?.length) {
+        ctx.log(
+          'WARN',
+          'TIKTOK_CREATOR_INFO_CACHED_FALLBACK',
+          'ดึง creator_info สดไม่สำเร็จชั่วคราว — ใช้ข้อมูลสิทธิ์บัญชีที่บันทึกไว้ล่าสุดแทน',
+          {
+            error:
+              creatorErr instanceof Error
+                ? creatorErr.message
+                : String(creatorErr),
+          }
+        );
+        info = ctx.account.creatorInfo;
+      } else {
+        throw creatorErr;
       }
-    );
-
-    if (!initRes.ok) {
-      throw new Error(`TikTok direct post init failed: ${await initRes.text()}`);
     }
-    const initJson = (await initRes.json()) as {
-      data?: { publish_id?: string; upload_url?: string };
-      error?: { code?: string; message?: string };
-    };
-    if (
-      (initJson.error?.code && initJson.error.code !== 'ok') ||
-      !initJson.data?.upload_url ||
-      !initJson.data.publish_id
-    ) {
-      throw new Error(
-        `TikTok init rejected: ${initJson.error?.message || JSON.stringify(initJson)}`
+
+    let requestedPrivacy: TikTokMetadata['privacyLevel'] = meta.privacyLevel;
+    if (!info.privacyLevelOptions.includes(requestedPrivacy)) {
+      const fallbackPrivacy = (
+        ['FOLLOWER_OF_CREATOR', 'MUTUAL_FOLLOW_FRIENDS', 'SELF_ONLY'] as const
+      ).find((p) => info.privacyLevelOptions.includes(p));
+      if (!fallbackPrivacy) {
+        throw new Error(
+          `Privacy level ${meta.privacyLevel} ไม่ได้รับอนุญาตสำหรับบัญชีนี้ (อนุญาต: ${info.privacyLevelOptions.join(', ')})`
+        );
+      }
+      ctx.log(
+        'WARN',
+        'TIKTOK_PRIVACY_ADJUSTED',
+        `บัญชีปรับเป็นส่วนตัว จึงเปลี่ยนระดับการมองเห็นจาก ${meta.privacyLevel} เป็น ${fallbackPrivacy} อัตโนมัติ`
       );
+      requestedPrivacy = fallbackPrivacy;
     }
 
-    const { publish_id: publishId, upload_url: uploadUrl } = initJson.data;
+    const { uploadFilePath, videoSizeBytes, usedCoverFrame } =
+      await this.resolveUploadMedia(ctx);
+    const coverTimestampMs = usedCoverFrame ? 0 : (meta.coverTimestampMs || 0);
+
+    // Step 2: Direct Post Init (with chunk-size fallback + 2-tier unaudited-app fallback)
+    const buildDirectPostPayload = (
+      privacyLevel: TikTokMetadata['privacyLevel'],
+      plan: TikTokChunkPlan
+    ) => ({
+      post_info: {
+        title: meta.caption,
+        privacy_level: privacyLevel,
+        disable_comment: !meta.allowComment || info.commentDisabled,
+        disable_duet: !meta.allowDuet || info.duetDisabled,
+        disable_stitch: !meta.allowStitch || info.stitchDisabled,
+        video_cover_timestamp_ms: coverTimestampMs,
+        brand_content_toggle: Boolean(meta.brandContentToggle),
+        brand_organic_toggle: Boolean(meta.brandOrganicToggle),
+        is_aigc: Boolean(meta.isAigc),
+      },
+      source_info: {
+        source: 'FILE_UPLOAD',
+        video_size: videoSizeBytes,
+        chunk_size: plan.chunkSize,
+        total_chunk_count: plan.totalChunkCount,
+      },
+    });
+
+    const UNAUDITED_RE = /unaudited_client_can_only_post_to_private_accounts/i;
+    const accessToken = ctx.accessToken;
+    const initDirectPost = (privacyLevel: TikTokMetadata['privacyLevel']) =>
+      this.initUploadWithChunkFallback({
+        endpoint: 'https://open.tiktokapis.com/v2/post/publish/video/init/',
+        accessToken,
+        videoSizeBytes,
+        errorLabel: 'TikTok direct post init',
+        buildPayload: (plan) => buildDirectPostPayload(privacyLevel, plan),
+      });
+
+    let initResult: { chunkPlan: TikTokChunkPlan; publishId: string; uploadUrl: string };
+    try {
+      initResult = await initDirectPost(requestedPrivacy);
+    } catch (directErr) {
+      const errMsg = directErr instanceof Error ? directErr.message : String(directErr);
+      if (!UNAUDITED_RE.test(errMsg)) throw directErr;
+
+      let recovered: { chunkPlan: TikTokChunkPlan; publishId: string; uploadUrl: string } | null =
+        null;
+      let latestUnauditedErr: unknown = directErr;
+
+      if (requestedPrivacy !== 'SELF_ONLY') {
+        ctx.log(
+          'WARN',
+          'TIKTOK_UNAUDITED_PRIVACY_FALLBACK',
+          'แอป TikTok ยังไม่ผ่านการ Audit จึงสลับระดับการมองเห็นเป็นส่วนตัว (SELF_ONLY) อัตโนมัติ'
+        );
+        try {
+          recovered = await initDirectPost('SELF_ONLY');
+        } catch (selfOnlyErr) {
+          const selfOnlyMsg =
+            selfOnlyErr instanceof Error ? selfOnlyErr.message : String(selfOnlyErr);
+          if (!UNAUDITED_RE.test(selfOnlyMsg)) throw selfOnlyErr;
+          latestUnauditedErr = selfOnlyErr;
+        }
+      }
+
+      if (!recovered) {
+        ctx.log(
+          'WARN',
+          'TIKTOK_INBOX_FALLBACK',
+          'แอป TikTok ยังไม่ผ่าน Audit สำหรับ Direct Post ไปยังบัญชีสาธารณะ — กำลังส่งคลิปเข้า TikTok App Inbox (Draft) แทน'
+        );
+        try {
+          const inboxInit = await this.initUploadWithChunkFallback({
+            endpoint: 'https://open.tiktokapis.com/v2/post/publish/inbox/video/init/',
+            accessToken,
+            videoSizeBytes,
+            errorLabel: 'TikTok inbox init',
+            buildPayload: (plan) => ({
+              source_info: {
+                source: 'FILE_UPLOAD',
+                video_size: videoSizeBytes,
+                chunk_size: plan.chunkSize,
+                total_chunk_count: plan.totalChunkCount,
+              },
+            }),
+          });
+          await this.uploadChunksSequential(
+            inboxInit.uploadUrl,
+            uploadFilePath,
+            videoSizeBytes,
+            inboxInit.chunkPlan.chunks
+          );
+          ctx.log(
+            'INFO',
+            'TIKTOK_INBOX_FALLBACK_DONE',
+            'ส่งคลิปเข้า TikTok App Inbox สำเร็จ — เปิดการแจ้งเตือนในแอป TikTok บนมือถือเพื่อกดโพสต์สาธารณะได้เลย',
+            { publishId: inboxInit.publishId }
+          );
+          return {
+            externalPostId: inboxInit.publishId,
+            externalUrl: `https://www.tiktok.com/@${(info.creatorUsername || ctx.account.externalAccountId).replace(/^@/, '')}`,
+          };
+        } catch (inboxErr) {
+          const inboxMsg = inboxErr instanceof Error ? inboxErr.message : String(inboxErr);
+          if (!UNAUDITED_RE.test(inboxMsg)) throw inboxErr;
+          void latestUnauditedErr;
+          throw new Error(
+            'TikTok ปฏิเสธการโพสต์ (unaudited_client_can_only_post_to_private_accounts): แอปใน TikTok Developer Portal ยังไม่ผ่านการ Audit จึงโพสต์ได้เฉพาะบัญชีที่ตั้งเป็น "บัญชีส่วนตัว (Private Account)" เท่านั้น — กรุณาเปิดแอป TikTok บนมือถือ > ตั้งค่าและความเป็นส่วนตัว > ความเป็นส่วนตัว > เปิด "บัญชีส่วนตัว" ชั่วคราวแล้วกดโพสต์ใหม่ (หลังโพสต์เสร็จหรือส่งแอปผ่าน Audit แล้วจึงเปิดสาธารณะได้)'
+          );
+        }
+      }
+
+      initResult = recovered;
+    }
+
+    const { chunkPlan, publishId, uploadUrl } = initResult;
 
     // Step 3: Sequential chunked PUT
     await this.uploadChunksSequential(
       uploadUrl,
-      ctx.localFilePath,
-      ctx.asset.fileSizeBytes,
+      uploadFilePath,
+      videoSizeBytes,
       chunkPlan.chunks
     );
 
     // Step 4: Poll status
     for (let i = 0; i < 30; i++) {
-      const stRes = await fetch(
+      const stRes = await fetchWithRetry(
         'https://open.tiktokapis.com/v2/post/publish/status/fetch/',
         {
           method: 'POST',
@@ -382,9 +501,12 @@ export class TikTokAdapter implements PlatformAdapter {
         if (st === 'PUBLISH_COMPLETE') {
           const postId =
             stJson.data?.publicaly_available_post_id?.[0] ?? publishId;
+          const handle = (
+            info.creatorUsername || ctx.account.externalAccountId
+          ).replace(/^@/, '');
           return {
             externalPostId: postId,
-            externalUrl: `https://www.tiktok.com/@${ctx.account.externalAccountId.replace(/^@/, '')}/video/${postId}`,
+            externalUrl: `https://www.tiktok.com/@${handle}/video/${postId}`,
           };
         }
         if (st === 'FAILED') {
@@ -399,6 +521,113 @@ export class TikTokAdapter implements PlatformAdapter {
     return { externalPostId: publishId, externalUrl: null };
   }
 
+  private resolveActualVideoSize(ctx: AdapterContext): number {
+    if (
+      ctx.account.connectionMode !== 'SIMULATION' &&
+      ctx.localFilePath &&
+      fs.existsSync(ctx.localFilePath)
+    ) {
+      const statSize = fs.statSync(ctx.localFilePath).size;
+      if (statSize > 0) return statSize;
+    }
+    return ctx.asset.fileSizeBytes;
+  }
+
+  private async resolveUploadMedia(ctx: AdapterContext): Promise<{
+    uploadFilePath: string;
+    videoSizeBytes: number;
+    usedCoverFrame: boolean;
+  }> {
+    let uploadFilePath = ctx.localFilePath;
+    let usedCoverFrame = false;
+    if (ctx.hasCustomCover && ctx.getCoverVideoPath) {
+      uploadFilePath = await ctx.getCoverVideoPath();
+      usedCoverFrame = uploadFilePath !== ctx.localFilePath;
+      if (usedCoverFrame) {
+        ctx.log(
+          'INFO',
+          'TIKTOK_COVER_FRAME_INJECTED',
+          'ฝังเฟรมหน้าปก (0.15 วินาที) ลงต้นคลิป TikTok พร้อมตั้ง video_cover_timestamp_ms=0'
+        );
+      }
+    }
+    const videoSizeBytes =
+      uploadFilePath && fs.existsSync(uploadFilePath)
+        ? Math.max(1, fs.statSync(uploadFilePath).size)
+        : this.resolveActualVideoSize(ctx);
+    return { uploadFilePath, videoSizeBytes, usedCoverFrame };
+  }
+
+  private async initUploadWithChunkFallback(params: {
+    endpoint: string;
+    accessToken: string;
+    videoSizeBytes: number;
+    errorLabel: string;
+    buildPayload: (chunkPlan: TikTokChunkPlan) => Record<string, unknown>;
+  }): Promise<{ chunkPlan: TikTokChunkPlan; publishId: string; uploadUrl: string }> {
+    const MIN_FALLBACK_MULTI_CHUNK_BYTES = 2 * 5_242_880;
+    let chunkPlan = computeTikTokChunkPlan(params.videoSizeBytes);
+
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const initRes = await fetchWithRetry(params.endpoint, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${params.accessToken}`,
+          'Content-Type': 'application/json; charset=UTF-8',
+        },
+        body: JSON.stringify(params.buildPayload(chunkPlan)),
+      });
+
+      const rawText = await initRes.text();
+      let initJson: {
+        data?: { publish_id?: string; upload_url?: string };
+        error?: { code?: string; message?: string };
+      } | null = null;
+      try {
+        initJson = JSON.parse(rawText);
+      } catch {
+        initJson = null;
+      }
+
+      const isInvalidChunkError =
+        /chunk\s*size/i.test(rawText) ||
+        (initJson?.error?.code === 'invalid_params' &&
+          /chunk/i.test(initJson.error.message || ''));
+
+      if (
+        attempt === 0 &&
+        (!initRes.ok || (initJson?.error?.code && initJson.error.code !== 'ok')) &&
+        isInvalidChunkError &&
+        chunkPlan.totalChunkCount === 1 &&
+        params.videoSizeBytes >= MIN_FALLBACK_MULTI_CHUNK_BYTES
+      ) {
+        chunkPlan = computeTikTokChunkPlan(params.videoSizeBytes, 5_242_880);
+        continue;
+      }
+
+      if (!initRes.ok) {
+        throw new Error(`${params.errorLabel} failed: ${rawText}`);
+      }
+      if (
+        (initJson?.error?.code && initJson.error.code !== 'ok') ||
+        !initJson?.data?.upload_url ||
+        !initJson?.data.publish_id
+      ) {
+        throw new Error(
+          `${params.errorLabel} rejected: ${initJson?.error?.message || rawText}`
+        );
+      }
+
+      return {
+        chunkPlan,
+        publishId: initJson.data.publish_id,
+        uploadUrl: initJson.data.upload_url,
+      };
+    }
+
+    throw new Error(`${params.errorLabel} failed unexpectedly`);
+  }
+
   private async uploadChunksSequential(
     uploadUrl: string,
     filePath: string,
@@ -410,7 +639,7 @@ export class TikTokAdapter implements PlatformAdapter {
       for (const chunk of chunks) {
         const buf = Buffer.alloc(chunk.size);
         await handle.read(buf, 0, chunk.size, chunk.start);
-        const res = await fetch(uploadUrl, {
+        const res = await fetchWithRetry(uploadUrl, {
           method: 'PUT',
           headers: {
             'Content-Type': 'video/mp4',

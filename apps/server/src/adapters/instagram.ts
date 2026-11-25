@@ -10,6 +10,10 @@ import type {
   PublishResult,
 } from './types.js';
 import { FacebookAdapter } from './facebook.js';
+import {
+  fetchWithRetry,
+  isTransientNetworkError,
+} from '../services/net-resilience.js';
 
 const GRAPH_VERSION = 'v22.0';
 const fbHelper = new FacebookAdapter();
@@ -64,6 +68,7 @@ export class InstagramAdapter implements PlatformAdapter {
 
     if (ctx.account.connectionMode === 'SIMULATION') {
       const containerId = `ig_cnt_${randomBytes(5).toString('hex')}`;
+      const containerCreatedAt = new Date().toISOString();
       ctx.log(
         'INFO',
         'IG_PREWARM_CONTAINER',
@@ -74,9 +79,10 @@ export class InstagramAdapter implements PlatformAdapter {
           coverUrl: ctx.asset.customCoverPublicUrl || null,
         }
       );
+      ctx.onContainerCreated?.(containerId, containerCreatedAt);
       return {
         externalContainerId: containerId,
-        containerCreatedAt: new Date().toISOString(),
+        containerCreatedAt,
       };
     }
 
@@ -84,37 +90,112 @@ export class InstagramAdapter implements PlatformAdapter {
       throw new Error('ไม่มี Instagram Business Access Token หรือ IG User ID');
     }
 
+    const canUsePublicUrl = Boolean(ctx.asset.publicUrl);
+    try {
+      return await this.createAndWaitContainer(ctx, meta, canUsePublicUrl);
+    } catch (err) {
+      const hasLocalFallback =
+        canUsePublicUrl &&
+        !isTransientNetworkError(err) &&
+        Boolean(ctx.localFilePath && fs.existsSync(ctx.localFilePath));
+      if (!hasLocalFallback) {
+        throw err;
+      }
+      const errMsg = err instanceof Error ? err.message : String(err);
+      ctx.log(
+        'WARN',
+        'IG_RESUMABLE_FALLBACK',
+        `สร้าง IG Container ผ่าน R2 video_url ไม่สำเร็จ (${errMsg}) — สลับไปอัปโหลดไฟล์ตรงผ่าน rupload.facebook.com อัตโนมัติ`
+      );
+      return await this.createAndWaitContainer(ctx, meta, false);
+    }
+  }
+
+  private async createAndWaitContainer(
+    ctx: AdapterContext,
+    meta: InstagramReelsMetadata,
+    usePublicUrl: boolean
+  ): Promise<PreWarmResult> {
     const igUserId = ctx.account.externalAccountId;
-    const token = ctx.accessToken;
-    const usePublicUrl = Boolean(ctx.asset.publicUrl);
+    const token = ctx.accessToken!;
+    const useCoverUrl = Boolean(ctx.asset.customCoverPublicUrl);
 
-    const createBody = new URLSearchParams({
-      access_token: token,
-      media_type: 'REELS',
-      caption: meta.caption || '',
-      share_to_feed: meta.shareToFeed ? 'true' : 'false',
-    });
-    if (meta.isAiGenerated) {
-      createBody.set('is_ai_generated', 'true');
-    }
-    if (ctx.asset.customCoverPublicUrl) {
-      createBody.set('cover_url', ctx.asset.customCoverPublicUrl);
-    } else if (meta.thumbOffsetMs > 0) {
-      createBody.set('thumb_offset', String(meta.thumbOffsetMs));
-    }
-
-    if (usePublicUrl && ctx.asset.publicUrl) {
-      createBody.set('video_url', ctx.asset.publicUrl);
-    } else {
-      createBody.set('upload_type', 'resumable');
+    let uploadFilePath = ctx.localFilePath;
+    let usedCoverFrame = false;
+    if (
+      !usePublicUrl &&
+      !useCoverUrl &&
+      ctx.hasCustomCover &&
+      ctx.getCoverVideoPath
+    ) {
+      uploadFilePath = await ctx.getCoverVideoPath();
+      usedCoverFrame = uploadFilePath !== ctx.localFilePath;
+      if (usedCoverFrame) {
+        ctx.log(
+          'INFO',
+          'IG_COVER_FRAME_INJECTED',
+          'ฝังเฟรมหน้าปก (0.15 วินาที) ลงต้นคลิป IG Reels (โหมดไม่มี R2) ก่อนอัปโหลด'
+        );
+      }
     }
 
-    const initRes = await fetch(
+    const buildCreateBody = (includeCoverUrl: boolean) => {
+      const body = new URLSearchParams({
+        access_token: token,
+        media_type: 'REELS',
+        caption: meta.caption || '',
+        share_to_feed: meta.shareToFeed ? 'true' : 'false',
+      });
+      if (meta.isAiGenerated) {
+        body.set('is_ai_generated', 'true');
+      }
+      if (includeCoverUrl && ctx.asset.customCoverPublicUrl) {
+        body.set('cover_url', ctx.asset.customCoverPublicUrl);
+      } else if (usedCoverFrame) {
+        body.set('thumb_offset', '0');
+      } else if (meta.thumbOffsetMs > 0) {
+        body.set('thumb_offset', String(meta.thumbOffsetMs));
+      }
+      if (usePublicUrl && ctx.asset.publicUrl) {
+        body.set('video_url', ctx.asset.publicUrl);
+      } else {
+        body.set('upload_type', 'resumable');
+      }
+      return body;
+    };
+
+    if (useCoverUrl) {
+      ctx.log(
+        'INFO',
+        'IG_COVER_URL_SET',
+        'แนบลิงก์หน้าปก (cover_url) ให้ IG Reels เรียบร้อย',
+        { coverUrl: ctx.asset.customCoverPublicUrl }
+      );
+    }
+
+    let initRes = await fetchWithRetry(
       `https://graph.facebook.com/${GRAPH_VERSION}/${igUserId}/media`,
-      { method: 'POST', body: createBody }
+      { method: 'POST', body: buildCreateBody(useCoverUrl) }
     );
     if (!initRes.ok) {
-      throw new Error(`IG media container init failed: ${await initRes.text()}`);
+      const errText = await initRes.text();
+      if (useCoverUrl && /cover_url|cover|image|download/i.test(errText)) {
+        ctx.log(
+          'WARN',
+          'IG_COVER_URL_FALLBACK',
+          'Meta ดึง cover_url ไม่สำเร็จ กำลังสร้าง Container ใหม่โดยใช้เฟรมจากวิดีโอแทน',
+          { error: errText }
+        );
+        initRes = await fetchWithRetry(
+          `https://graph.facebook.com/${GRAPH_VERSION}/${igUserId}/media`,
+          { method: 'POST', body: buildCreateBody(false) }
+        );
+        if (!initRes.ok) {
+          throw new Error(`IG media container init failed: ${await initRes.text()}`);
+        }
+      } else {
+        throw new Error(`IG media container init failed: ${errText}`);
+      }
     }
     const initJson = (await initRes.json()) as { id: string; uri?: string };
     const containerId = initJson.id;
@@ -123,10 +204,10 @@ export class InstagramAdapter implements PlatformAdapter {
       const uploadUri =
         initJson.uri ||
         `https://rupload.facebook.com/ig-api-upload/${GRAPH_VERSION}/${containerId}`;
-      const stat = await fs.promises.stat(ctx.localFilePath);
-      const fileBuf = await fs.promises.readFile(ctx.localFilePath);
+      const stat = await fs.promises.stat(uploadFilePath);
+      const fileBuf = await fs.promises.readFile(uploadFilePath);
 
-      const upRes = await fetch(uploadUri, {
+      const upRes = await fetchWithRetry(uploadUri, {
         method: 'POST',
         headers: {
           Authorization: `OAuth ${token}`,
@@ -143,7 +224,7 @@ export class InstagramAdapter implements PlatformAdapter {
 
     // Poll until FINISHED (up to ~3 minutes)
     for (let attempt = 0; attempt < 36; attempt++) {
-      const stRes = await fetch(
+      const stRes = await fetchWithRetry(
         `https://graph.facebook.com/${GRAPH_VERSION}/${containerId}?fields=status_code,status&access_token=${encodeURIComponent(token)}`
       );
       if (stRes.ok) {
@@ -152,12 +233,17 @@ export class InstagramAdapter implements PlatformAdapter {
           status?: string;
         };
         if (stData.status_code === 'FINISHED') {
-          ctx.log('INFO', 'IG_CONTAINER_FINISHED', 'IG Container ประมวลผลเสร็จพร้อมเผยแพร่', {
-            containerId,
-          });
+          const containerCreatedAt = new Date().toISOString();
+          ctx.log(
+            'INFO',
+            'IG_CONTAINER_FINISHED',
+            'IG Container ประมวลผลเสร็จพร้อมเผยแพร่',
+            { containerId }
+          );
+          ctx.onContainerCreated?.(containerId, containerCreatedAt);
           return {
             externalContainerId: containerId,
-            containerCreatedAt: new Date().toISOString(),
+            containerCreatedAt,
           };
         }
         if (stData.status_code === 'ERROR' || stData.status_code === 'EXPIRED') {
@@ -210,7 +296,7 @@ export class InstagramAdapter implements PlatformAdapter {
       throw new Error('Missing Instagram credentials');
     }
 
-    const pubRes = await fetch(
+    let pubRes = await fetchWithRetry(
       `https://graph.facebook.com/${GRAPH_VERSION}/${ctx.account.externalAccountId}/media_publish`,
       {
         method: 'POST',
@@ -221,7 +307,32 @@ export class InstagramAdapter implements PlatformAdapter {
       }
     );
     if (!pubRes.ok) {
-      throw new Error(`IG media_publish failed: ${await pubRes.text()}`);
+      const errText = await pubRes.text();
+      if (/expired|invalid.*creation_id|2207027|9007/i.test(errText)) {
+        ctx.log(
+          'WARN',
+          'IG_CONTAINER_RECREATE',
+          'Container เดิมหมดอายุหรือใช้งานไม่ได้ — กำลังสร้าง Container ใหม่และเผยแพร่อัตโนมัติ',
+          { previousContainerId: containerId, error: errText }
+        );
+        const warm = await this.preWarm(ctx);
+        containerId = warm.externalContainerId;
+        pubRes = await fetchWithRetry(
+          `https://graph.facebook.com/${GRAPH_VERSION}/${ctx.account.externalAccountId}/media_publish`,
+          {
+            method: 'POST',
+            body: new URLSearchParams({
+              access_token: ctx.accessToken,
+              creation_id: containerId,
+            }),
+          }
+        );
+        if (!pubRes.ok) {
+          throw new Error(`IG media_publish failed: ${await pubRes.text()}`);
+        }
+      } else {
+        throw new Error(`IG media_publish failed: ${errText}`);
+      }
     }
     const pubJson = (await pubRes.json()) as { id: string };
     return {

@@ -6,7 +6,7 @@ export declare const CONNECTION_MODES: readonly ["SIMULATION", "LIVE_OFFICIAL", 
 export type ConnectionMode = (typeof CONNECTION_MODES)[number];
 export declare const PUBLISH_STRATEGIES: readonly ["NATIVE_PREUPLOAD", "JIT_PUBLISH", "INBOX_DRAFT"];
 export type PublishStrategy = (typeof PUBLISH_STRATEGIES)[number];
-export declare const JOB_STATUSES: readonly ["DRAFT", "QUEUED", "PREUPLOADING", "NATIVE_SCHEDULED", "PREWARMING", "READY_TO_PUBLISH", "PUBLISHING", "PUBLISHED", "FAILED", "CANCELLED"];
+export declare const JOB_STATUSES: readonly ["DRAFT", "QUEUED", "PREUPLOADING", "NATIVE_SCHEDULED", "PREWARMING", "READY_TO_PUBLISH", "PUBLISHING", "UPLOADED", "PROCESSING", "PUBLISH_REQUESTED", "UNKNOWN", "PUBLISHED", "FAILED", "CANCELLED"];
 export type JobStatus = (typeof JOB_STATUSES)[number];
 export type ClipCategory = 'SHORT' | 'LONG';
 export type ClipTypeFilter = 'ANY' | 'SHORT' | 'LONG';
@@ -107,7 +107,10 @@ export interface MediaAssetSourceMeta {
     shotCount?: number;
     coverTimeSec?: number;
     syntheticMedia?: boolean;
+    visualStyle?: string;
     brief?: MasterBrief;
+    subtitlesSrt?: string;
+    subtitlesVtt?: string;
 }
 export interface MediaAsset {
     id: string;
@@ -147,6 +150,7 @@ export interface MasterBrief {
         title: string;
         url: string;
     }>;
+    visualStyle?: string;
     isSyntheticMedia?: boolean;
     coverTimestampMs?: number;
 }
@@ -225,6 +229,45 @@ export interface ContentItem {
     mediaAsset?: MediaAsset;
     jobs?: PublishJob[];
 }
+export interface FacebookReelPublication {
+    graphVersion: string;
+    legacy?: boolean;
+    effectiveGraphVersion?: string;
+    pageId: string;
+    videoId?: string;
+    postId?: string;
+    uploadUrl?: string;
+    fileSha256?: string;
+    fileSize?: number;
+    startRequestedAt?: string;
+    initializedAt?: string;
+    uploadRequestedAt?: string;
+    uploadedAt?: string;
+    finishRequestedAt?: string;
+    finishAcceptedAt?: string;
+    statusCheckedAt?: string;
+    confirmedAt?: string;
+    publishTime?: string;
+    phases?: {
+        video?: string;
+        uploading?: string;
+        processing?: string;
+        publishing?: string;
+        publishStatus?: string;
+        bytesTransferred?: number;
+    };
+    checks?: number;
+    rateLimitedUntil?: string;
+    verificationStartedAt?: string;
+    lastApiError?: {
+        stage: string;
+        at: string;
+        httpStatus?: number;
+        code?: number;
+        subcode?: number;
+        fbtraceId?: string;
+    };
+}
 export interface PublishJob {
     id: string;
     idempotencyKey: string;
@@ -238,6 +281,7 @@ export interface PublishJob {
     prewarmAt: string | null;
     status: JobStatus;
     externalPostId: string | null;
+    facebookReel?: FacebookReelPublication | null;
     externalContainerId: string | null;
     externalUrl: string | null;
     metadataSnapshot: Record<string, unknown>;
@@ -250,6 +294,11 @@ export interface PublishJob {
     updatedAt: string;
     accountName?: string;
     connectionMode?: ConnectionMode;
+    contentTopic?: string;
+    contentTargetDate?: string;
+    mediaAssetId?: string;
+    hasCustomCover?: boolean;
+    thumbnailFilename?: string | null;
 }
 export interface JobLog {
     id: string;

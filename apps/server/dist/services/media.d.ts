@@ -19,4 +19,14 @@ export declare function normalizeCoverImage(inputPath: string, outputJpegPath: s
     outputPath: string;
     sizeBytes: number;
 }>;
+export declare function prependCoverFrameToVideo(params: {
+    videoPath: string;
+    coverImagePath: string;
+    outputPath: string;
+    probe: MediaProbeInfo;
+    coverDurationSec?: number;
+}): Promise<{
+    outputPath: string;
+    sizeBytes: number;
+}>;
 //# sourceMappingURL=media.d.ts.map

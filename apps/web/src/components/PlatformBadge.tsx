@@ -176,6 +176,26 @@ const STATUS_META: Record<
     color: 'var(--apple-orange)',
     bg: 'rgba(255, 149, 0, 0.14)',
   },
+  UPLOADED: {
+    label: 'อัปโหลดแล้ว',
+    color: 'var(--apple-blue)',
+    bg: 'rgba(0, 122, 255, 0.12)',
+  },
+  PROCESSING: {
+    label: 'รอประมวลผล',
+    color: 'var(--apple-indigo)',
+    bg: 'rgba(88, 86, 214, 0.13)',
+  },
+  PUBLISH_REQUESTED: {
+    label: 'รอ Meta ยืนยันการเผยแพร่',
+    color: 'var(--apple-orange)',
+    bg: 'rgba(255, 149, 0, 0.14)',
+  },
+  UNKNOWN: {
+    label: 'ยืนยันสถานะไม่ได้',
+    color: 'var(--label-secondary)',
+    bg: 'var(--bg-grouped)',
+  },
   PUBLISHED: {
     label: 'เผยแพร่สำเร็จ',
     color: 'var(--apple-green)',

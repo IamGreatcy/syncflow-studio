@@ -7,6 +7,8 @@ import {
   detectRecommendedFormats,
   determinePublishStrategy,
   extractHashtags,
+  getLocalTodayDateStr,
+  getNextDayDateStr,
   resolveScheduledTimesForDate,
   utf8ByteLength,
   validateFormatMetadata,
@@ -20,6 +22,8 @@ describe('TikTok FILE_UPLOAD chunk planner (floor division spec)', () => {
   const sizes = [
     2_000_000,
     5_000_000,
+    7_500_000,
+    12_067_811,
     12_345_678,
     64_000_000,
     130_000_000,
@@ -33,9 +37,9 @@ describe('TikTok FILE_UPLOAD chunk planner (floor division spec)', () => {
       assert.ok(plan.totalChunkCount <= 1000);
       assert.equal(plan.chunks.length, plan.totalChunkCount);
 
-      if (size <= 5_000_000) {
-        assert.equal(plan.totalChunkCount, 1);
+      if (plan.totalChunkCount === 1) {
         assert.equal(plan.chunkSize, size);
+        assert.equal(plan.chunks[0].size, size);
       } else {
         assert.ok(plan.chunkSize >= 5_000_000 && plan.chunkSize <= 64_000_000);
         assert.equal(
@@ -43,6 +47,9 @@ describe('TikTok FILE_UPLOAD chunk planner (floor division spec)', () => {
           Math.floor(size / plan.chunkSize),
           'MUST use Math.floor(videoSize / chunkSize)'
         );
+        for (let i = 0; i < plan.chunks.length - 1; i++) {
+          assert.equal(plan.chunks[i].size, plan.chunkSize);
+        }
       }
 
       // Contiguous from 0 to size - 1
@@ -62,6 +69,13 @@ describe('TikTok FILE_UPLOAD chunk planner (floor division spec)', () => {
       );
     });
   }
+
+  it('splits >64 MB videos into >=2 chunks even with large preferredChunkBytes', () => {
+    const plan = computeTikTokChunkPlan(80_000_000, 50_000_000);
+    assert.ok(plan.totalChunkCount >= 2);
+    assert.ok(plan.chunkSize >= 5_000_000 && plan.chunkSize <= 64_000_000);
+    assert.equal(plan.chunks.reduce((acc, ch) => acc + ch.size, 0), 80_000_000);
+  });
 });
 
 describe('Platform metadata & UTF-8 byte / limit validation', () => {
@@ -362,5 +376,12 @@ describe('Schedule resolver & Hybrid publishing strategy', () => {
     assert.equal(rawFb.wasPastSlot, true);
     assert.equal(rawFb.targetDate, '2026-11-20');
     assert.equal(rawFb.localTime, '11:30');
+  });
+
+  it('computes channel-local today and next-day default without UTC off-by-one', () => {
+    // 2026-11-24T20:26:00Z == 2026-11-25 03:26 in Asia/Bangkok
+    const lateNightUtc = new Date('2026-11-24T20:26:00.000Z');
+    assert.equal(getLocalTodayDateStr('Asia/Bangkok', lateNightUtc), '2026-11-25');
+    assert.equal(getNextDayDateStr('Asia/Bangkok', lateNightUtc), '2026-11-26');
   });
 });

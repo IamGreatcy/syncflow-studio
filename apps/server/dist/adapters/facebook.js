@@ -96,7 +96,7 @@ export class FacebookAdapter {
             ctx.log('INFO', isReels ? 'FB_REELS_RUPLOAD' : 'FB_VIDEO_CHUNK_UPLOAD', `[Simulation] อัปโหลด ${ctx.job.format} ผ่าน ${isReels ? 'video_reels + rupload' : 'graph-video /videos'}`, {
                 scheduledPublishTimeUnix: Math.floor(targetMs / 1000),
                 nativeScheduled: useNativeSchedule,
-                hasCustomCover: Boolean(ctx.thumbnailPath && !isReels),
+                hasCustomCover: Boolean(ctx.thumbnailPath),
             });
             return {
                 externalPostId: simId,
@@ -108,76 +108,9 @@ export class FacebookAdapter {
             throw new Error('ไม่มี Page Access Token หรือ Page ID สำหรับ Facebook');
         }
         if (isReels) {
-            return this.uploadFacebookReel(ctx, useNativeSchedule);
+            throw new Error('Live Facebook Reels must run through the durable publishing scheduler');
         }
         return this.uploadFacebookPageVideo(ctx, useNativeSchedule);
-    }
-    async uploadFacebookReel(ctx, useNativeSchedule) {
-        if (ctx.asset.probe.durationSec > 90) {
-            throw new Error(`Facebook Reels API รองรับความยาวสูงสุด 90 วินาที (คลิปนี้ยาว ${Math.round(ctx.asset.probe.durationSec)} วินาที) กรุณาสลับเป็น Facebook วิดีโอเพจ`);
-        }
-        const pageId = ctx.account.externalAccountId;
-        const token = ctx.accessToken;
-        const meta = ctx.job.metadataSnapshot;
-        const stat = await fs.promises.stat(ctx.localFilePath);
-        // 1. Start session
-        const startRes = await fetch(`https://graph.facebook.com/${GRAPH_VERSION}/${pageId}/video_reels`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                upload_phase: 'start',
-                access_token: token,
-            }),
-        });
-        if (!startRes.ok) {
-            throw new Error(`FB Reels start failed: ${await startRes.text()}`);
-        }
-        const { video_id: videoId, upload_url: uploadUrl } = (await startRes.json());
-        // 2. Binary upload to rupload.facebook.com
-        const fileBuf = await fs.promises.readFile(ctx.localFilePath);
-        const ruploadRes = await fetch(uploadUrl, {
-            method: 'POST',
-            headers: {
-                Authorization: `OAuth ${token}`,
-                offset: '0',
-                file_size: String(stat.size),
-                'Content-Type': 'application/octet-stream',
-            },
-            body: fileBuf,
-        });
-        if (!ruploadRes.ok) {
-            throw new Error(`FB Reels rupload failed: ${await ruploadRes.text()}`);
-        }
-        // 3. Finish & schedule or publish
-        const finishParams = new URLSearchParams({
-            access_token: token,
-            video_id: videoId,
-            upload_phase: 'finish',
-            description: meta.description || '',
-        });
-        if (meta.title)
-            finishParams.set('title', meta.title);
-        if (meta.isAiGenerated)
-            finishParams.set('is_ai_generated', 'true');
-        if (useNativeSchedule) {
-            finishParams.set('video_state', 'SCHEDULED');
-            finishParams.set('scheduled_publish_time', String(Math.floor(new Date(ctx.job.scheduledAt).getTime() / 1000)));
-        }
-        else {
-            finishParams.set('video_state', 'PUBLISHED');
-        }
-        const finishRes = await fetch(`https://graph.facebook.com/${GRAPH_VERSION}/${pageId}/video_reels`, {
-            method: 'POST',
-            body: finishParams,
-        });
-        if (!finishRes.ok) {
-            throw new Error(`FB Reels finish failed: ${await finishRes.text()}`);
-        }
-        return {
-            externalPostId: videoId,
-            externalUrl: `https://www.facebook.com/reel/${videoId}`,
-            status: useNativeSchedule ? 'NATIVE_SCHEDULED' : 'PUBLISHED',
-        };
     }
     async uploadFacebookPageVideo(ctx, useNativeSchedule) {
         const pageId = ctx.account.externalAccountId;
@@ -242,20 +175,7 @@ export class FacebookAdapter {
             throw new Error(`FB video finish failed: ${await finishRes.text()}`);
         }
         if (ctx.thumbnailPath && fs.existsSync(ctx.thumbnailPath)) {
-            try {
-                const thumbBuf = await fs.promises.readFile(ctx.thumbnailPath);
-                const thumbForm = new FormData();
-                thumbForm.append('access_token', token);
-                thumbForm.append('is_preferred', 'true');
-                thumbForm.append('source', new Blob([thumbBuf], { type: 'image/jpeg' }), 'cover.jpg');
-                await fetch(`https://graph.facebook.com/${GRAPH_VERSION}/${startJson.video_id}/thumbnails`, { method: 'POST', body: thumbForm });
-                ctx.log('INFO', 'FB_THUMBNAIL_SET', 'อัปโหลดภาพหน้าปก Facebook Video สำเร็จ');
-            }
-            catch (err) {
-                ctx.log('WARN', 'FB_THUMBNAIL_WARN', 'ไม่สามารถอัปโหลดภาพปก Facebook ได้', {
-                    error: err instanceof Error ? err.message : String(err),
-                });
-            }
+            await this.uploadFacebookThumbnail(startJson.video_id, token, ctx.thumbnailPath, ctx, 'Facebook Video');
         }
         return {
             externalPostId: startJson.video_id,
@@ -263,7 +183,41 @@ export class FacebookAdapter {
             status: useNativeSchedule ? 'NATIVE_SCHEDULED' : 'PUBLISHED',
         };
     }
+    async uploadFacebookThumbnail(videoId, token, thumbnailPath, ctx, label) {
+        const thumbBuf = await fs.promises.readFile(thumbnailPath);
+        let lastError = 'Unknown error';
+        for (let attempt = 1; attempt <= 3; attempt++) {
+            try {
+                const thumbForm = new FormData();
+                thumbForm.append('access_token', token);
+                thumbForm.append('is_preferred', 'true');
+                thumbForm.append('source', new Blob([thumbBuf], { type: 'image/jpeg' }), 'cover.jpg');
+                const res = await fetch(`https://graph.facebook.com/${GRAPH_VERSION}/${videoId}/thumbnails`, { method: 'POST', body: thumbForm });
+                if (res.ok) {
+                    ctx.log('INFO', 'FB_THUMBNAIL_SET', `อัปโหลดภาพหน้าปก ${label} สำเร็จ`, {
+                        videoId,
+                        attempt,
+                    });
+                    return;
+                }
+                lastError = `HTTP ${res.status}: ${await res.text()}`;
+            }
+            catch (err) {
+                lastError = err instanceof Error ? err.message : String(err);
+            }
+            if (attempt < 3) {
+                await new Promise((r) => setTimeout(r, 3000));
+            }
+        }
+        ctx.log('WARN', 'FB_THUMBNAIL_WARN', `ไม่สามารถอัปโหลดภาพปก ${label} ได้`, {
+            videoId,
+            error: lastError,
+        });
+    }
     async publishNow(ctx) {
+        if (ctx.job.format === 'FACEBOOK_REELS' && ctx.account.connectionMode === 'LIVE_OFFICIAL') {
+            throw new Error('Live Facebook Reels must run through the durable publishing scheduler');
+        }
         if (ctx.job.status === 'NATIVE_SCHEDULED' && ctx.job.externalPostId) {
             ctx.log('INFO', 'FB_NATIVE_VERIFY', 'คลิป Facebook ถูกตั้งเวลาล่วงหน้าไว้แล้ว — ยืนยันสถานะเผยแพร่', { externalPostId: ctx.job.externalPostId });
             return {
@@ -279,32 +233,47 @@ export class FacebookAdapter {
     }
     async updateSchedule(params) {
         const { ctx, newScheduledAtIso } = params;
-        if (!ctx.job.externalPostId)
+        const videoId = ctx.job.facebookReel?.videoId ?? ctx.job.externalPostId;
+        if (!videoId)
             return;
         if (ctx.account.connectionMode === 'SIMULATION') {
             ctx.log('INFO', 'FB_RESCHEDULE', `[Simulation] อัปเดตเวลา scheduled_publish_time บน Facebook เป็น ${newScheduledAtIso}`);
             return;
         }
-        if (!ctx.accessToken)
+        if (!ctx.accessToken) {
+            if (ctx.job.facebookReel)
+                throw new Error('Reconnect the original Facebook Page first.');
             return;
-        await fetch(`https://graph.facebook.com/${GRAPH_VERSION}/${ctx.job.externalPostId}`, {
+        }
+        const response = await fetch(`https://graph.facebook.com/${GRAPH_VERSION}/${videoId}`, {
             method: 'POST',
+            signal: AbortSignal.timeout(15_000),
             body: new URLSearchParams({
                 access_token: ctx.accessToken,
                 scheduled_publish_time: String(Math.floor(new Date(newScheduledAtIso).getTime() / 1000)),
             }),
         });
+        if (ctx.job.facebookReel && (!response.ok || (await response.json().catch(() => null))?.success !== true)) {
+            throw new Error('Meta did not confirm the scheduled Reel change (HTTP ' + response.status + ').');
+        }
     }
     async cancelSchedule(ctx) {
-        if (!ctx.job.externalPostId)
+        const videoId = ctx.job.facebookReel?.videoId ?? ctx.job.externalPostId;
+        if (!videoId)
             return;
         if (ctx.account.connectionMode === 'SIMULATION') {
-            ctx.log('INFO', 'FB_CANCEL', `[Simulation] ยกเลิกวิดีโอที่ตั้งเวลาไว้ ${ctx.job.externalPostId}`);
+            ctx.log('INFO', 'FB_CANCEL', `[Simulation] ยกเลิกวิดีโอที่ตั้งเวลาไว้ ${videoId}`);
             return;
         }
-        if (!ctx.accessToken)
+        if (!ctx.accessToken) {
+            if (ctx.job.facebookReel)
+                throw new Error('Reconnect the original Facebook Page first.');
             return;
-        await fetch(`https://graph.facebook.com/${GRAPH_VERSION}/${ctx.job.externalPostId}?access_token=${encodeURIComponent(ctx.accessToken)}`, { method: 'DELETE' });
+        }
+        const response = await fetch(`https://graph.facebook.com/${GRAPH_VERSION}/${videoId}?access_token=${encodeURIComponent(ctx.accessToken)}`, { method: 'DELETE', signal: AbortSignal.timeout(15_000) });
+        if (ctx.job.facebookReel && (!response.ok || (await response.json().catch(() => null))?.success !== true)) {
+            throw new Error('Meta did not confirm the scheduled Reel change (HTTP ' + response.status + ').');
+        }
     }
 }
 //# sourceMappingURL=facebook.js.map

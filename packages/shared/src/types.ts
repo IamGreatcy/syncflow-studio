@@ -25,6 +25,10 @@ export const JOB_STATUSES = [
   'PREWARMING',
   'READY_TO_PUBLISH',
   'PUBLISHING',
+  'UPLOADED',
+  'PROCESSING',
+  'PUBLISH_REQUESTED',
+  'UNKNOWN',
   'PUBLISHED',
   'FAILED',
   'CANCELLED',
@@ -140,7 +144,10 @@ export interface MediaAssetSourceMeta {
   shotCount?: number;
   coverTimeSec?: number;
   syntheticMedia?: boolean;
+  visualStyle?: string;
   brief?: MasterBrief;
+  subtitlesSrt?: string;
+  subtitlesVtt?: string;
 }
 
 export interface MediaAsset {
@@ -179,6 +186,7 @@ export interface MasterBrief {
   coverHeadline?: string;
   coverSubline?: string;
   sources?: Array<{ title: string; url: string }>;
+  visualStyle?: string;
   isSyntheticMedia?: boolean;
   coverTimestampMs?: number;
 }
@@ -266,6 +274,46 @@ export interface ContentItem {
   jobs?: PublishJob[];
 }
 
+export interface FacebookReelPublication {
+  graphVersion: string;
+  legacy?: boolean;
+  effectiveGraphVersion?: string;
+  pageId: string;
+  videoId?: string;
+  postId?: string;
+  uploadUrl?: string;
+  fileSha256?: string;
+  fileSize?: number;
+  startRequestedAt?: string;
+  initializedAt?: string;
+  uploadRequestedAt?: string;
+  uploadedAt?: string;
+  finishRequestedAt?: string;
+  finishAcceptedAt?: string;
+  statusCheckedAt?: string;
+  confirmedAt?: string;
+  publishTime?: string;
+  phases?: {
+    video?: string;
+    uploading?: string;
+    processing?: string;
+    publishing?: string;
+    publishStatus?: string;
+    bytesTransferred?: number;
+  };
+  checks?: number;
+  rateLimitedUntil?: string;
+  verificationStartedAt?: string;
+  lastApiError?: {
+    stage: string;
+    at: string;
+    httpStatus?: number;
+    code?: number;
+    subcode?: number;
+    fbtraceId?: string;
+  };
+}
+
 export interface PublishJob {
   id: string;
   idempotencyKey: string;
@@ -279,6 +327,7 @@ export interface PublishJob {
   prewarmAt: string | null;
   status: JobStatus;
   externalPostId: string | null;
+  facebookReel?: FacebookReelPublication | null;
   externalContainerId: string | null;
   externalUrl: string | null;
   metadataSnapshot: Record<string, unknown>;
@@ -291,6 +340,11 @@ export interface PublishJob {
   updatedAt: string;
   accountName?: string;
   connectionMode?: ConnectionMode;
+  contentTopic?: string;
+  contentTargetDate?: string;
+  mediaAssetId?: string;
+  hasCustomCover?: boolean;
+  thumbnailFilename?: string | null;
 }
 
 export interface JobLog {

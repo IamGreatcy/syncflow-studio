@@ -1,5 +1,5 @@
 import { DatabaseSync } from 'node:sqlite';
-import type { AppSettingsPublic, Channel, ClipCategory, ClipTypeFilter, ConnectionMode, ContentFormat, ContentItem, JobLog, JobStatus, MasterBrief, MediaAsset, MediaAssetSourceMeta, MediaProbeInfo, MetadataTemplate, Orientation, Platform, PlatformMetadataMap, PublishJob, PublishStrategy, ScheduleRule, SocialAccount, SocialAccountConfig, TikTokCreatorInfo, ToneStyle } from '@clipflow/shared';
+import type { AppSettingsPublic, Channel, ClipCategory, ClipTypeFilter, ConnectionMode, ContentFormat, ContentItem, FacebookReelPublication, JobLog, JobStatus, MasterBrief, MediaAsset, MediaAssetSourceMeta, MediaProbeInfo, MetadataTemplate, Orientation, Platform, PlatformMetadataMap, PublishJob, PublishStrategy, ScheduleRule, SocialAccount, SocialAccountConfig, TikTokCreatorInfo, ToneStyle } from '@clipflow/shared';
 import { SecretCipher } from './crypto.js';
 export interface InternalAccountSecrets {
     account: SocialAccount;
@@ -27,6 +27,8 @@ export interface AppSettingsFull {
     metaAppSecret: string;
     tiktokClientKey: string;
     tiktokClientSecret: string;
+}
+export declare class FacebookReelDuplicateError extends Error {
 }
 export declare class ClipFlowDb {
     readonly sqlite: DatabaseSync;
@@ -185,7 +187,8 @@ export declare class ClipFlowDb {
     /**
      * Atomically claims due jobs using BEGIN IMMEDIATE so concurrent ticks never duplicate work.
      */
-    claimDueJobs(nowIso: string, limit?: number): PublishJob[];
+    claimDueJobs(nowIso: string, limit?: number, allowLiveFacebookReels?: boolean): PublishJob[];
+    facebookReelRateLimitedUntil(pageId: string, nowIso: string): string | null;
     claimSpecificJob(jobId: string, nowIso: string): PublishJob | null;
     updateJob(id: string, patch: Partial<{
         status: JobStatus;
@@ -193,6 +196,7 @@ export declare class ClipFlowDb {
         scheduledAt: string;
         prewarmAt: string | null;
         externalPostId: string | null;
+        facebookReel: FacebookReelPublication | null;
         externalContainerId: string | null;
         externalUrl: string | null;
         metadataSnapshot: Record<string, unknown>;
@@ -200,7 +204,7 @@ export declare class ClipFlowDb {
         nextRetryAt: string | null;
         lastError: string | null;
         lockedUntil: string | null;
-    }>): PublishJob | null;
+    }>, expectedLock?: string): PublishJob | null;
     addJobLog(jobId: string, level: 'INFO' | 'WARN' | 'ERROR', stage: string, message: string, details?: Record<string, unknown> | null): JobLog;
     listJobLogs(jobId: string): JobLog[];
     private mapJob;

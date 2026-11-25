@@ -15,6 +15,13 @@ export async function publishViaUnifiedApi(ctx) {
     const form = new FormData();
     const fileBuf = await fs.promises.readFile(ctx.localFilePath);
     form.append('video', new Blob([fileBuf], { type: ctx.asset.mimeType || 'video/mp4' }), ctx.asset.originalFilename || 'video.mp4');
+    if (ctx.thumbnailPath && fs.existsSync(ctx.thumbnailPath)) {
+        const thumbBuf = await fs.promises.readFile(ctx.thumbnailPath);
+        form.append('thumbnail', new Blob([thumbBuf], { type: 'image/jpeg' }), 'cover.jpg');
+    }
+    if (ctx.asset.customCoverPublicUrl) {
+        form.append('cover_url', ctx.asset.customCoverPublicUrl);
+    }
     form.append('platform', ctx.job.platform.toLowerCase());
     form.append('format', ctx.job.format);
     form.append('profile_id', ctx.account.config.unifiedAccountId || ctx.account.externalAccountId);

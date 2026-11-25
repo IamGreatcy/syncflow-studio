@@ -7,9 +7,34 @@ import type {
 } from '@clipflow/shared';
 import type { ClipFlowDb } from '../db/database.js';
 import type { StorageService } from '../services/storage.js';
-import { getAdapter } from '../adapters/registry.js';
+import { getAdapter, tiktokAdapter } from '../adapters/registry.js';
+import { formatTikTokAccountDisplayName } from '../adapters/tiktok.js';
 import { publishViaUnifiedApi } from '../adapters/unified.js';
 import type { AdapterContext } from '../adapters/types.js';
+import { prepareFacebookReelMedia, runFacebookReel } from '../adapters/facebook-reel.js';
+import {
+  formatErrorWithCause,
+  isTransientNetworkError,
+} from '../services/net-resilience.js';
+
+const MAX_NETWORK_OUTAGE_RETRIES = 72; // ~6 hours at capped 5-minute interval
+
+export function isOfficialFacebookReel(job: PublishJob): boolean {
+  return job.format === 'FACEBOOK_REELS' && Boolean(job.facebookReel || job.connectionMode === 'LIVE_OFFICIAL');
+}
+
+export function hasFacebookReelIntent(job: PublishJob): boolean {
+  return isOfficialFacebookReel(job) && Boolean(
+    job.facebookReel?.startRequestedAt || job.facebookReel?.videoId || job.facebookReel?.legacy ||
+    job.externalPostId || ['PREUPLOADING', 'PUBLISHING', 'UNKNOWN'].includes(job.status)
+  );
+}
+
+export function facebookReelRuntime(env: NodeJS.ProcessEnv) {
+  const environment = env.RAILWAY_ENVIRONMENT_ID || env.RAILWAY_DEPLOYMENT_ID ? 'railway' : 'local';
+  const owner = env.SYNCFLOW_FACEBOOK_REEL_OWNER?.trim() || 'disabled';
+  return { environment, owner, allowed: owner === 'railway' && environment === 'railway' };
+}
 
 export class SchedulerEngine {
   private timer: NodeJS.Timeout | null = null;
@@ -19,7 +44,8 @@ export class SchedulerEngine {
 
   constructor(
     private readonly db: ClipFlowDb,
-    private readonly storage: StorageService
+    private readonly storage: StorageService,
+    readonly liveFacebookReelsEnabled = true
   ) {}
 
   start(intervalMs = 15_000): void {
@@ -69,13 +95,30 @@ export class SchedulerEngine {
     }
     this.isTickRunning = true;
     this.lastTickAt = now.toISOString();
+    const tickStartedAt = performance.now();
 
     try {
-      const dueJobs = this.db.claimDueJobs(now.toISOString(), 10);
+      const dueJobs = this.db.claimDueJobs(now.toISOString(), 10, this.liveFacebookReelsEnabled);
       const results: Array<{ jobId: string; status: string }> = [];
+      const seenLiveOfficialAccountIds = new Set<string>();
 
       for (const job of dueJobs) {
-        const updated = await this.executeClaimedJob(job, now, false);
+        const acc = this.db.getAccount(job.socialAccountId);
+        if (acc?.connectionMode === 'LIVE_OFFICIAL') {
+          if (seenLiveOfficialAccountIds.has(job.socialAccountId)) {
+            const staggeredRetry = new Date(now.getTime() + 90_000).toISOString();
+            this.db.updateJob(job.id, {
+              lockedUntil: null,
+              nextRetryAt: staggeredRetry,
+            }, isOfficialFacebookReel(job) ? job.lockedUntil ?? undefined : undefined);
+            results.push({ jobId: job.id, status: job.status });
+            continue;
+          }
+          seenLiveOfficialAccountIds.add(job.socialAccountId);
+        }
+        const jobTime = isOfficialFacebookReel(job)
+          ? new Date(now.getTime() + Math.floor(performance.now() - tickStartedAt)) : now;
+        const updated = await this.executeClaimedJob(job, jobTime, false);
         results.push({ jobId: job.id, status: updated.status });
       }
 
@@ -89,6 +132,8 @@ export class SchedulerEngine {
     jobId: string,
     now: Date = new Date()
   ): Promise<PublishJob> {
+    const current = this.db.getJob(jobId);
+    if (current && isOfficialFacebookReel(current)) this.requireFacebookReelOwner();
     const claimed = this.db.claimSpecificJob(jobId, now.toISOString());
     if (!claimed) {
       const existing = this.db.getJob(jobId);
@@ -97,7 +142,27 @@ export class SchedulerEngine {
         `ไม่สามารถรันงานสถานะ ${existing.status} หรือมี worker กำลังทำงานอยู่`
       );
     }
+    if (hasFacebookReelIntent(claimed)) {
+      return this.executeFacebookReel(claimed, now, false, true);
+    }
     return this.executeClaimedJob(claimed, now, true);
+  }
+
+  async verifyFacebookReel(jobId: string, now: Date = new Date()): Promise<PublishJob> {
+    const existing = this.db.getJob(jobId);
+    if (!existing || !isOfficialFacebookReel(existing) || !existing.facebookReel?.videoId ||
+        existing.status === 'CANCELLED' || existing.status === 'PUBLISHED') {
+      throw new Error('This job has no Facebook Reel awaiting verification.');
+    }
+    const claimed = this.db.claimSpecificJob(jobId, now.toISOString());
+    if (!claimed) throw new Error('This check is already running or waiting for Meta’s retry window.');
+    return this.executeFacebookReel(claimed, now, false, true);
+  }
+
+  private requireFacebookReelOwner(): void {
+    if (!this.liveFacebookReelsEnabled) {
+      throw new Error('Live Facebook Reel scheduling is disabled on this SyncFlow instance. Use the designated publisher.');
+    }
   }
 
   async rescheduleJobExternal(
@@ -113,7 +178,13 @@ export class SchedulerEngine {
       return job;
     }
 
-    if (job.status === 'NATIVE_SCHEDULED' && job.externalPostId) {
+    if (isOfficialFacebookReel(job)) {
+      this.requireFacebookReelOwner();
+      if (hasFacebookReelIntent(job) || (job.lockedUntil && Date.parse(job.lockedUntil) >= Date.now())) {
+        throw new Error('Verify and manage the existing Reel on Facebook before changing this job.');
+      }
+    }
+    if (job.status === 'NATIVE_SCHEDULED' && (job.externalPostId || job.facebookReel?.videoId)) {
       const ctx = await this.buildContext(job);
       const adapter = getAdapter(job.platform);
       if (adapter.updateSchedule) {
@@ -155,7 +226,13 @@ export class SchedulerEngine {
       throw new Error('งานนี้เผยแพร่สำเร็จแล้ว ไม่สามารถยกเลิกคิวได้');
     }
 
-    if (job.status === 'NATIVE_SCHEDULED' && job.externalPostId) {
+    if (isOfficialFacebookReel(job)) {
+      this.requireFacebookReelOwner();
+      if (hasFacebookReelIntent(job) || (job.lockedUntil && Date.parse(job.lockedUntil) >= Date.now())) {
+        throw new Error('An existing Facebook Reel must be managed on Facebook; refreshing its status is safe.');
+      }
+    }
+    if (job.status === 'NATIVE_SCHEDULED' && (job.externalPostId || job.facebookReel?.videoId)) {
       try {
         const ctx = await this.buildContext(job);
         const adapter = getAdapter(job.platform);
@@ -163,11 +240,12 @@ export class SchedulerEngine {
           await adapter.cancelSchedule(ctx);
         }
       } catch (err) {
+        if (isOfficialFacebookReel(job)) throw err;
         this.db.addJobLog(
           job.id,
           'WARN',
           'CANCEL_REMOTE_WARN',
-          `ยกเลิกบนแพลตฟอร์มปลายทางไม่สำเร็จ: ${err instanceof Error ? err.message : String(err)}`
+          `ยกเลิกบนแพลตฟอร์มปลายทางไม่สำเร็จ: ${formatErrorWithCause(err)}`
         );
       }
     }
@@ -209,8 +287,10 @@ export class SchedulerEngine {
           status: 'CONNECTED',
         });
         refreshed++;
-      } catch {
-        this.db.updateAccount(acc.id, { status: 'NEEDS_REAUTH' });
+      } catch (err) {
+        if (!isTransientNetworkError(err)) {
+          this.db.updateAccount(acc.id, { status: 'NEEDS_REAUTH' });
+        }
       }
     }
 
@@ -236,10 +316,36 @@ export class SchedulerEngine {
       settings
     );
 
-    let thumbnailPath: string | null = null;
-    if (asset.customCoverKey) {
-      thumbnailPath = await this.storage.ensureCustomCover(asset.id, settings);
+    const customCoverPath = asset.customCoverKey
+      ? await this.storage.ensureCustomCover(asset.id, settings)
+      : null;
+    if (
+      customCoverPath &&
+      fs.existsSync(customCoverPath) &&
+      !asset.customCoverPublicUrl
+    ) {
+      try {
+        const sync = await this.storage.syncLocalFileToStorage({
+          localPath: customCoverPath,
+          storageKey: `covers/${asset.id}_cover.jpg`,
+          mimeType: 'image/jpeg',
+          settings,
+        });
+        if (sync.publicUrl) {
+          this.db.updateMediaAssetCover(
+            asset.id,
+            asset.customCoverKey!,
+            sync.publicUrl
+          );
+          asset.customCoverPublicUrl = sync.publicUrl;
+        }
+      } catch {
+        // Best-effort R2 backfill for cover_url
+      }
     }
+
+    let thumbnailPath: string | null =
+      customCoverPath && fs.existsSync(customCoverPath) ? customCoverPath : null;
     if (!thumbnailPath && asset.thumbnailPaths.length > 0) {
       const ytMeta = job.metadataSnapshot as Partial<YouTubeMetadata>;
       const idx =
@@ -254,7 +360,11 @@ export class SchedulerEngine {
       thumbnailPath = candidate;
     }
 
-    // Refresh token right before execution if expiring within 15 minutes
+    const hasCustomCover = Boolean(
+      customCoverPath && fs.existsSync(customCoverPath)
+    );
+
+    // Refresh token right before execution if expiring within 60 minutes
     let accessToken = accountData.accessToken;
     let refreshToken = accountData.refreshToken;
     if (
@@ -263,7 +373,7 @@ export class SchedulerEngine {
       refreshToken
     ) {
       const expMs = new Date(accountData.account.tokenExpiresAt).getTime();
-      if (expMs - Date.now() < 15 * 60_000) {
+      if (expMs - Date.now() < 60 * 60_000) {
         const adapter = getAdapter(job.platform);
         if (adapter.refreshAccessToken) {
           const next = await adapter.refreshAccessToken(refreshToken, settings);
@@ -273,6 +383,7 @@ export class SchedulerEngine {
             accessToken,
             refreshToken,
             tokenExpiresAt: next.expiresAt ?? null,
+            status: 'CONNECTED',
           });
         }
       }
@@ -286,6 +397,29 @@ export class SchedulerEngine {
       asset,
       localFilePath,
       thumbnailPath,
+      hasCustomCover,
+      getCoverVideoPath: async () =>
+        hasCustomCover && customCoverPath
+          ? this.storage.ensureCoverPrependedVideo({
+              assetId: asset.id,
+              videoPath: localFilePath,
+              coverPath: customCoverPath,
+              probe: asset.probe,
+            })
+          : localFilePath,
+      onContainerCreated: (containerId, createdAtIso) => {
+        const latest = this.db.getJob(job.id);
+        const snap = {
+          ...(latest?.metadataSnapshot ?? job.metadataSnapshot),
+          __containerCreatedAt: createdAtIso,
+        };
+        this.db.updateJob(job.id, {
+          externalContainerId: containerId,
+          metadataSnapshot: snap,
+        });
+        job.externalContainerId = containerId;
+        job.metadataSnapshot = snap;
+      },
       settings,
       log: (level, stage, message, details) => {
         this.db.addJobLog(job.id, level, stage, message, details ?? null);
@@ -298,6 +432,9 @@ export class SchedulerEngine {
     now: Date,
     forcePublishNow: boolean
   ): Promise<PublishJob> {
+    if (isOfficialFacebookReel(job)) {
+      return this.executeFacebookReel(job, now, forcePublishNow, false);
+    }
     const initialStatus = job.status;
     try {
       const ctx = await this.buildContext(job);
@@ -371,6 +508,31 @@ export class SchedulerEngine {
             __containerCreatedAt: warmRes.containerCreatedAt,
           };
         } else {
+          if (ctx.hasCustomCover && ctx.getCoverVideoPath) {
+            await ctx.getCoverVideoPath().catch(() => {});
+          }
+          if (
+            job.platform === 'TIKTOK' &&
+            ctx.account.connectionMode === 'LIVE_OFFICIAL' &&
+            ctx.accessToken
+          ) {
+            try {
+              const info = await tiktokAdapter.fetchCreatorInfo(
+                ctx.accessToken,
+                false
+              );
+              const cleanName = formatTikTokAccountDisplayName(
+                info,
+                ctx.account.accountName
+              );
+              this.db.updateAccount(ctx.account.id, {
+                creatorInfo: info,
+                accountName: cleanName,
+              });
+            } catch {
+              // Best-effort creator_info warm-up; publishNow has cached fallback
+            }
+          }
           this.db.addJobLog(
             job.id,
             'INFO',
@@ -413,9 +575,13 @@ export class SchedulerEngine {
       // Not due yet — release lock safely
       return this.db.updateJob(job.id, { lockedUntil: null })!;
     } catch (err) {
-      const errorMsg = err instanceof Error ? err.message : String(err);
+      const errorMsg = formatErrorWithCause(err);
+      const isNetTransient = isTransientNetworkError(err);
       const nextRetryCount = job.retryCount + 1;
-      const canRetry = !forcePublishNow && nextRetryCount <= job.maxRetries;
+      const effectiveMaxRetries = isNetTransient
+        ? Math.max(job.maxRetries, MAX_NETWORK_OUTAGE_RETRIES)
+        : job.maxRetries;
+      const canRetry = !forcePublishNow && nextRetryCount <= effectiveMaxRetries;
 
       const safeRecoveryStatus =
         initialStatus === 'NATIVE_SCHEDULED'
@@ -424,19 +590,33 @@ export class SchedulerEngine {
             ? 'READY_TO_PUBLISH'
             : 'QUEUED';
 
-      const backoffMs = Math.pow(2, nextRetryCount) * 60_000;
+      // Capped backoff (max 5 minutes) for network outage so job recovers quickly once Wi-Fi reconnects
+      const backoffMs = isNetTransient
+        ? Math.min(5 * 60_000, Math.pow(2, Math.min(nextRetryCount, 3)) * 30_000)
+        : Math.pow(2, nextRetryCount) * 60_000;
       const nextRetryAt = canRetry
         ? new Date(now.getTime() + backoffMs).toISOString()
         : null;
 
       this.db.addJobLog(
         job.id,
-        'ERROR',
-        canRetry ? 'RETRY_SCHEDULED' : 'JOB_FAILED',
+        isNetTransient && canRetry ? 'WARN' : 'ERROR',
         canRetry
-          ? `เกิดข้อผิดพลาด (${errorMsg}) — จะลองใหม่อัตโนมัติครั้งที่ ${nextRetryCount}/${job.maxRetries}`
+          ? isNetTransient
+            ? 'NETWORK_WAIT_RETRY'
+            : 'RETRY_SCHEDULED'
+          : 'JOB_FAILED',
+        canRetry
+          ? isNetTransient
+            ? `เครือข่าย/อินเทอร์เน็ตขัดข้องชั่วคราว (${errorMsg}) — ระบบจะรอเชื่อมต่อและลองใหม่อัตโนมัติ (ครั้งที่ ${nextRetryCount})`
+            : `เกิดข้อผิดพลาด (${errorMsg}) — จะลองใหม่อัตโนมัติครั้งที่ ${nextRetryCount}/${effectiveMaxRetries}`
           : `งานล้มเหลวถาวร: ${errorMsg}`,
-        { retryCount: nextRetryCount, nextRetryAt }
+        {
+          retryCount: nextRetryCount,
+          maxRetries: effectiveMaxRetries,
+          transientNetwork: isNetTransient,
+          nextRetryAt,
+        }
       );
 
       const updated = this.db.updateJob(job.id, {
@@ -453,6 +633,60 @@ export class SchedulerEngine {
 
       return updated;
     }
+  }
+
+  private async executeFacebookReel(
+    job: PublishJob, now: Date, forcePublishNow: boolean, verifyOnly: boolean
+  ): Promise<PublishJob> {
+    const lock = job.lockedUntil;
+    if (!lock || job.status === 'CANCELLED' || (!verifyOnly && !this.liveFacebookReelsEnabled)) {
+      return this.db.updateJob(job.id, { lockedUntil: null }, lock ?? undefined) ?? job;
+    }
+    const untilScheduled = Date.parse(job.scheduledAt) - now.getTime();
+    const nativeSchedule = !forcePublishNow && untilScheduled >= 10 * 60_000 &&
+      untilScheduled <= 29 * 24 * 60 * 60_000 && job.strategy === 'NATIVE_PREUPLOAD';
+    if (!verifyOnly && !hasFacebookReelIntent(job) && !forcePublishNow && !nativeSchedule && untilScheduled > 0) {
+      return this.db.updateJob(job.id, {
+        status: 'READY_TO_PUBLISH', lockedUntil: null, nextRetryAt: null,
+      }, lock) ?? this.db.getJob(job.id) ?? job;
+    }
+
+    try {
+      const account = this.db.getAccountWithSecrets(job.socialAccountId);
+      const pageId = account?.account.externalAccountId ?? '';
+      const cooldown = this.db.facebookReelRateLimitedUntil(pageId, now.toISOString());
+      if (cooldown) {
+        return this.db.updateJob(job.id, { lockedUntil: null, nextRetryAt: cooldown }, lock) ?? job;
+      }
+      await runFacebookReel({
+        job, now, verifyOnly, nativeSchedule,
+        pageId,
+        token: account?.account.connectionMode === 'LIVE_OFFICIAL' ? account.accessToken : null,
+        loadMedia: async () => prepareFacebookReelMedia(await this.buildContext(job)),
+        save: (patch) => {
+          if (!this.db.updateJob(job.id, patch, lock)) throw new Error('Facebook Reel worker lease changed');
+        },
+        log: (level, stage, message, details) => {
+          this.db.addJobLog(job.id, level, stage, message, details);
+        },
+      });
+    } catch {
+      // A worker may fail after sending a request. Keep the durable intent
+      // and allow this Video ID to be checked without posting again.
+      const latest = this.db.getJob(job.id);
+      if (latest?.lockedUntil === lock) {
+        this.db.updateJob(job.id, {
+          status: latest.status === 'PUBLISHED' ? 'PUBLISHED' : 'UNKNOWN',
+          lastError: latest.status === 'PUBLISHED' ? null : 'The Facebook Reel worker stopped before verification completed.',
+          nextRetryAt: null,
+        }, lock);
+      }
+    }
+    const finished = this.db.updateJob(job.id, { lockedUntil: null }, lock) ?? this.db.getJob(job.id) ?? job;
+    if (finished.status === 'FAILED' && job.status !== 'FAILED' && finished.lastError) {
+      void this.sendFailureWebhook(finished, finished.lastError).catch(() => {});
+    }
+    return finished;
   }
 
   private async sendFailureWebhook(

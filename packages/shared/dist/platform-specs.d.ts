@@ -18,6 +18,13 @@ export interface FormatSpec {
     preferredAspect: '9:16' | '16:9' | 'ANY';
 }
 export declare const PLATFORM_LIMITS: Record<ContentFormat, FormatSpec>;
+export declare const STYLIZED_ANIMATION_VISUAL_STYLES: Set<string>;
+/**
+ * Per 2025-2026 YouTube Altered/Synthetic, TikTok AIGC, and Meta AI Info rules:
+ * Clearly stylized/cartoon/2D animation is exempt from realistic-AI disclosure labels,
+ * whereas photorealistic or unspecified synthetic media requires disclosure.
+ */
+export declare function requiresRealisticAiDisclosure(visualStyle?: string | null, fallback?: boolean): boolean;
 export declare function formatToPlatform(format: ContentFormat): Platform;
 export declare function utf8ByteLength(text: string): number;
 export declare function truncateUtf8Bytes(text: string, maxBytes: number): string;

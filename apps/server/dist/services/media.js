@@ -281,4 +281,83 @@ export async function normalizeCoverImage(inputPath, outputJpegPath) {
     }
     return { outputPath: outputJpegPath, sizeBytes: stat.size };
 }
+export async function prependCoverFrameToVideo(params) {
+    const { videoPath, coverImagePath, outputPath, probe, coverDurationSec = 0.15, } = params;
+    const rot = ((probe.rotation % 360) + 360) % 360;
+    const rawW = rot === 90 || rot === 270 ? probe.height : probe.width;
+    const rawH = rot === 90 || rot === 270 ? probe.width : probe.height;
+    const w = rawW > 0 ? Math.max(2, Math.floor(rawW / 2) * 2) : 720;
+    const h = rawH > 0 ? Math.max(2, Math.floor(rawH / 2) * 2) : 1280;
+    const fps = probe.fps > 0 && probe.fps <= 60 ? probe.fps : 30;
+    const sampleRate = probe.audioSampleRate && probe.audioSampleRate > 0
+        ? probe.audioSampleRate
+        : 48000;
+    const hasAudio = Boolean(probe.audioCodec);
+    fs.mkdirSync(path.dirname(outputPath), { recursive: true });
+    const tmpPath = `${outputPath}.${process.pid}.${Date.now()}.tmp.mp4`;
+    const filterComplex = hasAudio
+        ? `[0:v]scale=${w}:${h}:force_original_aspect_ratio=increase,crop=${w}:${h},setsar=1,fps=${fps},format=yuv420p[covv];` +
+            `[1:v]scale=${w}:${h}:force_original_aspect_ratio=decrease,pad=${w}:${h}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=${fps},format=yuv420p[mainv];` +
+            `[2:a]aformat=sample_rates=${sampleRate}:channel_layouts=stereo[cova];` +
+            `[1:a]aformat=sample_rates=${sampleRate}:channel_layouts=stereo[maina];` +
+            `[covv][cova][mainv][maina]concat=n=2:v=1:a=1[v][a]`
+        : `[0:v]scale=${w}:${h}:force_original_aspect_ratio=increase,crop=${w}:${h},setsar=1,fps=${fps},format=yuv420p[covv];` +
+            `[1:v]scale=${w}:${h}:force_original_aspect_ratio=decrease,pad=${w}:${h}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=${fps},format=yuv420p[mainv];` +
+            `[covv][mainv]concat=n=2:v=1:a=0[v]`;
+    const args = [
+        '-y',
+        '-loop',
+        '1',
+        '-t',
+        String(coverDurationSec),
+        '-i',
+        coverImagePath,
+        '-i',
+        videoPath,
+        ...(hasAudio
+            ? [
+                '-f',
+                'lavfi',
+                '-t',
+                String(coverDurationSec),
+                '-i',
+                `anullsrc=r=${sampleRate}:cl=stereo`,
+            ]
+            : []),
+        '-filter_complex',
+        filterComplex,
+        '-map',
+        '[v]',
+        ...(hasAudio ? ['-map', '[a]'] : []),
+        '-c:v',
+        'libx264',
+        '-preset',
+        'veryfast',
+        '-crf',
+        '20',
+        '-pix_fmt',
+        'yuv420p',
+        '-g',
+        String(Math.max(12, Math.round(fps * 2))),
+        ...(hasAudio ? ['-c:a', 'aac', '-ar', String(sampleRate), '-b:a', '128k'] : []),
+        '-map_metadata',
+        '-1',
+        '-metadata:s:v:0',
+        'handler_name=VideoHandler',
+        ...(hasAudio ? ['-metadata:s:a:0', 'handler_name=SoundHandler'] : []),
+        '-movflags',
+        '+faststart',
+        tmpPath,
+    ];
+    try {
+        await execFileAsync('ffmpeg', args, { timeout: 600_000 });
+        fs.renameSync(tmpPath, outputPath);
+        const stat = await fs.promises.stat(outputPath);
+        return { outputPath, sizeBytes: stat.size };
+    }
+    catch (err) {
+        fs.rmSync(tmpPath, { force: true });
+        throw err;
+    }
+}
 //# sourceMappingURL=media.js.map

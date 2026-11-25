@@ -9,10 +9,11 @@ import {
   Settings,
   Sparkles,
 } from 'lucide-react';
-import type {
-  ContentItem,
-  PublishJob,
-  SyncCutEpisodeSummary,
+import {
+  getLocalTodayDateStr,
+  type ContentItem,
+  type PublishJob,
+  type SyncCutEpisodeSummary,
 } from '@clipflow/shared';
 import { api, type ChannelWithAccounts } from './api';
 import { SegmentedControl, ToastBanner } from './components/AppleUI';
@@ -64,7 +65,7 @@ export function App() {
     dateStr: string;
     file?: File | null;
     prefill?: PlannerPrefill | null;
-  }>({ open: false, dateStr: new Date().toISOString().slice(0, 10) });
+  }>({ open: false, dateStr: getLocalTodayDateStr('Asia/Bangkok') });
 
   const notify = useCallback((type: 'success' | 'error', text: string) => {
     setToast({ type, text });
@@ -163,6 +164,13 @@ export function App() {
     return () => clearInterval(timer);
   }, [loadChannelWork]);
 
+  const activeChannel =
+    channels.find((c) => c.id === activeChannelId) ?? channels[0] ?? null;
+
+  const activeJobsCount = jobs.filter(
+    (j) => !['PUBLISHED', 'CANCELLED'].includes(j.status)
+  ).length;
+
   // Keyboard shortcuts: 'N' = New clip sheet, 'Escape' = Close sheet
   useEffect(() => {
     function onKey(e: KeyboardEvent) {
@@ -172,7 +180,7 @@ export function App() {
         e.preventDefault();
         setPlannerState({
           open: true,
-          dateStr: new Date().toISOString().slice(0, 10),
+          dateStr: getLocalTodayDateStr(activeChannel?.timezone || 'Asia/Bangkok'),
           file: null,
         });
       } else if (e.key === 'Escape' && plannerState.open) {
@@ -181,10 +189,7 @@ export function App() {
     }
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  }, [plannerState.open]);
-
-  const activeChannel =
-    channels.find((c) => c.id === activeChannelId) ?? channels[0] ?? null;
+  }, [plannerState.open, activeChannel?.timezone]);
 
   const readySynccutCount = synccutState.episodes.filter(
     (e) => e.hasVideo
@@ -208,7 +213,7 @@ export function App() {
       id: 'jobs',
       label: 'คิวงาน & ประวัติ',
       icon: Activity,
-      badge: jobs.length,
+      badge: activeJobsCount,
     },
     { id: 'channels', label: 'ช่อง & การเชื่อมต่อ API', icon: Layers },
     { id: 'settings', label: 'เทมเพลต & ตั้งค่า', icon: Settings },
@@ -421,7 +426,9 @@ export function App() {
               onClick={() =>
                 setPlannerState({
                   open: true,
-                  dateStr: new Date().toISOString().slice(0, 10),
+                  dateStr: getLocalTodayDateStr(
+                    activeChannel?.timezone || 'Asia/Bangkok'
+                  ),
                   file: null,
                 })
               }
@@ -514,6 +521,7 @@ export function App() {
                 <JobsView
                   channel={activeChannel}
                   jobs={jobs}
+                  contents={contents}
                   onRefresh={loadChannelWork}
                   onNotify={notify}
                 />

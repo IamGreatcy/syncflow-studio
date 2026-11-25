@@ -14,6 +14,10 @@ import { seedDefaultChannelData } from '../src/db/seed.js';
 import { StorageService } from '../src/services/storage.js';
 import { generateMetadataDeterministic } from '../src/services/metadata-engine.js';
 import { SchedulerEngine } from '../src/scheduler/engine.js';
+import {
+  formatErrorWithCause,
+  isTransientNetworkError,
+} from '../src/services/net-resilience.js';
 
 describe('SecretCipher AES-256-GCM', () => {
   it('encrypts and decrypts secrets and rejects tampered ciphertext', () => {
@@ -266,6 +270,219 @@ describe('ClipFlowDb & Hybrid SchedulerEngine', () => {
 
       db.close();
     } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it('survives extended Wi-Fi / DNS outage (> maxRetries) for IG & TikTok JIT jobs, unwraps err.cause, auto-heals TikTok account name, and recovers when back online', async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'clipflow-netoutage-'));
+    const origFetch = globalThis.fetch;
+    try {
+      // 1. Verify err.cause unwrapping for undici TypeError: fetch failed
+      const dnsCause = Object.assign(new Error('getaddrinfo ENOTFOUND graph.facebook.com'), {
+        code: 'ENOTFOUND',
+        syscall: 'getaddrinfo',
+        hostname: 'graph.facebook.com',
+      });
+      const fetchErr = new TypeError('fetch failed', { cause: dnsCause });
+      assert.equal(isTransientNetworkError(fetchErr), true);
+      const formatted = formatErrorWithCause(fetchErr);
+      assert.ok(formatted.includes('ENOTFOUND'), `Expected ENOTFOUND in: ${formatted}`);
+      assert.ok(formatted.includes('graph.facebook.com'), `Expected hostname in: ${formatted}`);
+
+      const db = new ClipFlowDb(':memory:', 'd'.repeat(64));
+      const storage = new StorageService(tmpDir);
+      const scheduler = new SchedulerEngine(db, storage);
+
+      const ch = db.createChannel({ name: 'Resilience Channel' });
+      seedDefaultChannelData(db, ch.id);
+      const accounts = db.listAccounts(ch.id);
+      const igAcc = accounts.find((a) => a.platform === 'INSTAGRAM')!;
+      const ttAcc = accounts.find((a) => a.platform === 'TIKTOK')!;
+
+      // Connect IG & TikTok in LIVE_OFFICIAL mode; verify TikTok auto-heals "(Simulation)" name
+      db.updateAccount(igAcc.id, {
+        connectionMode: 'LIVE_OFFICIAL',
+        externalAccountId: '17841437675564069',
+        accountName: '@tuenpidyuk',
+        accessToken: 'ig_live_token',
+      });
+      const updatedTt = db.updateAccount(ttAcc.id, {
+        connectionMode: 'LIVE_OFFICIAL',
+        externalAccountId: 'open_id_tt',
+        accessToken: 'tt_live_token',
+        creatorInfo: {
+          creatorUsername: 'tuenpidyuk5',
+          creatorNickname: 'Tuenpidyuk',
+          privacyLevelOptions: ['PUBLIC_TO_EVERYONE', 'SELF_ONLY'],
+          commentDisabled: false,
+          duetDisabled: false,
+          stitchDisabled: false,
+          maxVideoPostDurationSec: 3600,
+          fetchedAt: '2026-11-22T00:00:00.000Z',
+        },
+      });
+      assert.equal(updatedTt?.accountName, 'Tuenpidyuk (@tuenpidyuk5)');
+
+      const dummyKey = 'med_outage.mp4';
+      fs.writeFileSync(storage.resolveLocalPath(dummyKey), Buffer.alloc(2048, 7));
+      const asset = db.createMediaAsset({
+        id: 'med_outage',
+        channelId: ch.id,
+        originalFilename: 'outage.mp4',
+        storageProvider: 'R2',
+        storageKey: dummyKey,
+        publicUrl: 'https://pub-test.r2.dev/med_outage.mp4',
+        thumbnailPaths: [],
+        mimeType: 'video/mp4',
+        fileSizeBytes: 2048,
+        probe: {
+          durationSec: 15,
+          width: 1080,
+          height: 1920,
+          rotation: 0,
+          fps: 30,
+          videoCodec: 'h264',
+          audioCodec: 'aac',
+          audioSampleRate: 48000,
+          bitrateKbps: 2000,
+          fileSizeBytes: 2048,
+          hasFaststartMoov: true,
+        },
+        orientation: 'VERTICAL',
+        clipCategory: 'SHORT',
+      });
+
+      const tDue = '2026-11-22T12:30:00.000Z';
+      const content = db.createContentWithJobs({
+        channelId: ch.id,
+        mediaAssetId: asset.id,
+        targetDate: '2026-11-22',
+        masterBrief: {
+          topic: 'Outage Recovery Clip',
+          hook: 'Hook',
+          summary: 'Summary',
+          keyPoints: [],
+          cta: 'Follow',
+          coreHashtags: ['#test'],
+          language: 'th',
+          tone: 'FRIENDLY',
+        },
+        platformMetadata: {},
+        jobs: [
+          {
+            socialAccountId: igAcc.id,
+            platform: 'INSTAGRAM',
+            format: 'INSTAGRAM_REELS',
+            strategy: 'JIT_PUBLISH',
+            scheduledAt: tDue,
+            prewarmAt: '2026-11-22T12:18:00.000Z',
+            metadataSnapshot: { caption: 'IG Outage Test', shareToFeed: true, thumbOffsetMs: 0 },
+          },
+          {
+            socialAccountId: ttAcc.id,
+            platform: 'TIKTOK',
+            format: 'TIKTOK',
+            strategy: 'JIT_PUBLISH',
+            scheduledAt: tDue,
+            prewarmAt: '2026-11-22T12:18:00.000Z',
+            metadataSnapshot: {
+              caption: 'TT Outage Test',
+              privacyLevel: 'PUBLIC_TO_EVERYONE',
+              allowComment: true,
+              allowDuet: true,
+              allowStitch: true,
+            },
+          },
+        ],
+      });
+
+      // Simulate Wi-Fi disconnected across 5 scheduler ticks (> maxRetries = 3)
+      let isOffline = true;
+      globalThis.fetch = (async (input: string | URL | Request) => {
+        if (isOffline) {
+          throw new TypeError('fetch failed', {
+            cause: Object.assign(new Error('getaddrinfo ENOTFOUND'), {
+              code: 'ENOTFOUND',
+              syscall: 'getaddrinfo',
+              hostname: new URL(String(input)).hostname,
+            }),
+          });
+        }
+        const url = String(input);
+        if (url.includes('graph.facebook.com') && url.endsWith('/media')) {
+          return Response.json({ id: 'ig_cont_999' });
+        }
+        if (url.includes('graph.facebook.com') && url.includes('fields=status_code')) {
+          return Response.json({ status_code: 'FINISHED' });
+        }
+        if (url.includes('graph.facebook.com') && url.endsWith('/media_publish')) {
+          return Response.json({ id: 'ig_post_999' });
+        }
+        if (url.includes('creator_info/query')) {
+          return Response.json({
+            data: {
+              creator_username: 'tuenpidyuk5',
+              creator_nickname: 'Tuenpidyuk',
+              privacy_level_options: ['PUBLIC_TO_EVERYONE', 'SELF_ONLY'],
+            },
+            error: { code: 'ok' },
+          });
+        }
+        if (url.includes('post/publish/video/init')) {
+          return Response.json({
+            data: {
+              publish_id: 'tt_pub_999',
+              upload_url: 'https://open-upload.tiktokapis.com/upload/999',
+            },
+            error: { code: 'ok' },
+          });
+        }
+        if (url.includes('open-upload.tiktokapis.com')) {
+          return new Response('', { status: 201 });
+        }
+        if (url.includes('status/fetch')) {
+          return Response.json({
+            data: {
+              status: 'PUBLISH_COMPLETE',
+              publicaly_available_post_id: ['tt_post_999'],
+            },
+            error: { code: 'ok' },
+          });
+        }
+        throw new Error(`Unexpected URL: ${url}`);
+      }) as typeof fetch;
+
+      let simTimeMs = new Date('2026-11-22T12:30:10.000Z').getTime();
+      for (let attempt = 1; attempt <= 5; attempt++) {
+        await scheduler.tick(new Date(simTimeMs));
+        simTimeMs += 6 * 60_000;
+      }
+
+      // After 5 offline attempts (> 3), jobs must NOT be marked FAILED!
+      let jobs = db.listJobs({ contentItemId: content.id });
+      for (const j of jobs) {
+        assert.notEqual(j.status, 'FAILED', `${j.platform} should not fail permanently during Wi-Fi outage`);
+        assert.equal(j.retryCount, 5);
+        assert.ok(j.lastError?.includes('ENOTFOUND'), `Expected ENOTFOUND in lastError: ${j.lastError}`);
+        const logs = db.listJobLogs(j.id);
+        assert.ok(logs.some((l) => l.stage === 'NETWORK_WAIT_RETRY'));
+      }
+
+      // Now Wi-Fi reconnects -> next tick publishes both IG Reels & TikTok automatically!
+      isOffline = false;
+      await scheduler.tick(new Date(simTimeMs));
+      jobs = db.listJobs({ contentItemId: content.id });
+      for (const j of jobs) {
+        assert.equal(j.status, 'PUBLISHED', `Expected ${j.platform} to recover and publish after Wi-Fi reconnect`);
+        assert.equal(j.contentTopic, content.masterBrief.topic);
+        assert.equal(j.contentTargetDate, '2026-11-22');
+        assert.equal(j.mediaAssetId, asset.id);
+      }
+
+      db.close();
+    } finally {
+      globalThis.fetch = origFetch;
       fs.rmSync(tmpDir, { recursive: true, force: true });
     }
   });

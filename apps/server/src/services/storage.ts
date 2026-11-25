@@ -1,13 +1,15 @@
 import fs from 'node:fs';
 import https from 'node:https';
 import path from 'node:path';
+import { createHash } from 'node:crypto';
 import { pipeline } from 'node:stream/promises';
 import type { Readable } from 'node:stream';
+import type { MediaProbeInfo } from '@clipflow/shared';
 import { S3Client, DeleteObjectCommand, GetObjectCommand } from '@aws-sdk/client-s3';
 import { Upload } from '@aws-sdk/lib-storage';
 import { NodeHttpHandler } from '@smithy/node-http-handler';
 import type { AppSettingsFull } from '../db/database.js';
-import { normalizeCoverImage } from './media.js';
+import { normalizeCoverImage, prependCoverFrameToVideo } from './media.js';
 
 export interface SavedObjectResult {
   storageProvider: 'LOCAL' | 'R2';
@@ -21,6 +23,7 @@ export class StorageService {
   readonly dataDir: string;
   readonly uploadsDir: string;
   readonly thumbnailsDir: string;
+  private readonly coverVideoBuilds = new Map<string, Promise<string>>();
 
   constructor(baseDataDir?: string) {
     this.dataDir = baseDataDir || path.resolve(process.cwd(), 'data');
@@ -202,6 +205,53 @@ export class StorageService {
     } catch {
       return null;
     }
+  }
+
+  async ensureCoverPrependedVideo(params: {
+    assetId: string;
+    videoPath: string;
+    coverPath: string;
+    probe: MediaProbeInfo;
+    coverDurationSec?: number;
+  }): Promise<string> {
+    const coverDurationSec = params.coverDurationSec ?? 0.15;
+    const [videoStat, coverStat] = await Promise.all([
+      fs.promises.stat(params.videoPath),
+      fs.promises.stat(params.coverPath),
+    ]);
+    const hash = createHash('sha256')
+      .update(
+        `${videoStat.size}:${videoStat.mtimeMs}:${coverStat.size}:${coverStat.mtimeMs}:${coverDurationSec}`
+      )
+      .digest('hex')
+      .slice(0, 16);
+    const cacheDir = path.join(this.uploadsDir, '_cover_cache');
+    const cachedPath = path.join(cacheDir, `${params.assetId}_${hash}.mp4`);
+    if (fs.existsSync(cachedPath) && fs.statSync(cachedPath).size > 0) {
+      return cachedPath;
+    }
+
+    const key = `${params.assetId}_${hash}`;
+    const existing = this.coverVideoBuilds.get(key);
+    if (existing) {
+      return existing;
+    }
+
+    const buildPromise = (async () => {
+      await prependCoverFrameToVideo({
+        videoPath: params.videoPath,
+        coverImagePath: params.coverPath,
+        outputPath: cachedPath,
+        probe: params.probe,
+        coverDurationSec,
+      });
+      return cachedPath;
+    })().finally(() => {
+      this.coverVideoBuilds.delete(key);
+    });
+
+    this.coverVideoBuilds.set(key, buildPromise);
+    return buildPromise;
   }
 
   async saveCustomCoverFromPath(params: {

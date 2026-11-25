@@ -9,12 +9,17 @@ import { getCookie, setCookie } from 'hono/cookie';
 import { pipeline } from 'node:stream/promises';
 import { Readable } from 'node:stream';
 import { z } from 'zod';
-import { CONTENT_FORMATS, PLATFORMS, computePrewarmIso, detectRecommendedFormats, determinePublishStrategy, formatToPlatform, resolveScheduledTimesForDate, validateFormatMetadata, validateVideoCompatibility, zonedDateTimeToUtcIso, } from '@clipflow/shared';
+import { CONTENT_FORMATS, PLATFORMS, computePrewarmIso, detectRecommendedFormats, determinePublishStrategy, formatToPlatform, requiresRealisticAiDisclosure, resolveScheduledTimesForDate, validateFormatMetadata, validateVideoCompatibility, zonedDateTimeToUtcIso, } from '@clipflow/shared';
+import { diagnoseFacebookReel } from './services/facebook-diagnostics.js';
+import { FACEBOOK_REELS_GRAPH_VERSION } from './adapters/facebook-reel.js';
+import { FacebookReelDuplicateError } from './db/database.js';
 import { seedDefaultChannelData } from './db/seed.js';
 import { checkFfmpegAvailability, extractThumbnails, optimizeVideoForPlatforms, probeVideo, } from './services/media.js';
 import { generateMetadataWithAI } from './services/metadata-engine.js';
 import { getSyncCutCoverPath, importSyncCutEpisode, listSyncCutEpisodes, } from './services/synccut-bridge.js';
+import { hasFacebookReelIntent, isOfficialFacebookReel } from './scheduler/engine.js';
 import { getAdapter, tiktokAdapter } from './adapters/registry.js';
+import { formatTikTokAccountDisplayName } from './adapters/tiktok.js';
 import { discoverMetaPages, } from './adapters/facebook.js';
 const MIME_BY_EXT = {
     '.html': 'text/html; charset=utf-8',
@@ -306,16 +311,30 @@ export function createApp(params) {
             stats: {
                 channels: channels.length,
                 totalJobs: jobs.length,
-                queuedJobs: jobs.filter((j) => j.status === 'QUEUED').length,
+                activeJobs: jobs.filter((j) => !['PUBLISHED', 'FAILED', 'CANCELLED'].includes(j.status)).length,
+                queuedJobs: jobs.filter((j) => [
+                    'QUEUED',
+                    'PREUPLOADING',
+                    'PREWARMING',
+                    'READY_TO_PUBLISH',
+                    'PUBLISHING',
+                ].includes(j.status)).length,
                 nativeScheduledJobs: jobs.filter((j) => j.status === 'NATIVE_SCHEDULED')
                     .length,
                 publishedJobs: jobs.filter((j) => j.status === 'PUBLISHED').length,
                 failedJobs: jobs.filter((j) => j.status === 'FAILED').length,
+                cancelledJobs: jobs.filter((j) => j.status === 'CANCELLED').length,
             },
             schedulerLastTickAt: scheduler.lastTickAt,
         });
     });
     // ---------- Channels (max 3 default) ----------
+    app.get('/api/runtime/facebook', (c) => c.json({
+        verifier: 'durable-reel-status',
+        requestedGraphVersion: FACEBOOK_REELS_GRAPH_VERSION,
+        runtime: params.runtime ?? null,
+        schedulerLastTickAt: scheduler.lastTickAt,
+    }));
     app.get('/api/channels', (c) => {
         const channels = db.listChannels().map((ch) => ({
             ...ch,
@@ -466,6 +485,7 @@ export function createApp(params) {
             tokenExpiresAt: tokens.expiresAt ?? null,
             externalAccountId: tokens.externalAccountId,
             accountName: tokens.accountName,
+            creatorInfo: tokens.creatorInfo ?? undefined,
             status: 'CONNECTED',
         });
         if (entry.platform === 'FACEBOOK' && tokens.pairedIgAccount && updated) {
@@ -673,10 +693,7 @@ export function createApp(params) {
             let accountName = account.accountName;
             try {
                 creatorInfo = await tiktokAdapter.fetchCreatorInfo(token, false);
-                if (creatorInfo.creatorNickname || creatorInfo.creatorUsername) {
-                    accountName =
-                        creatorInfo.creatorNickname || `@${creatorInfo.creatorUsername}`;
-                }
+                accountName = formatTikTokAccountDisplayName(creatorInfo, account.accountName);
             }
             catch {
                 // Allow saving sandbox token even if creator_info rate/scope varies
@@ -745,7 +762,13 @@ export function createApp(params) {
         }
         try {
             const info = await tiktokAdapter.fetchCreatorInfo(secrets.accessToken, secrets.account.connectionMode === 'SIMULATION');
-            const updated = db.updateAccount(id, { creatorInfo: info });
+            const nextName = secrets.account.connectionMode === 'LIVE_OFFICIAL'
+                ? formatTikTokAccountDisplayName(info, secrets.account.accountName)
+                : secrets.account.accountName;
+            const updated = db.updateAccount(id, {
+                creatorInfo: info,
+                accountName: nextName,
+            });
             return c.json({ creatorInfo: info, account: updated });
         }
         catch (err) {
@@ -1165,6 +1188,7 @@ export function createApp(params) {
                 sources: z
                     .array(z.object({ title: z.string(), url: z.string() }))
                     .optional(),
+                visualStyle: z.string().optional(),
                 isSyntheticMedia: z.boolean().optional(),
                 coverTimestampMs: z.number().optional(),
             }),
@@ -1267,6 +1291,8 @@ export function createApp(params) {
         const asset = db.getMediaAsset(parsed.data.mediaAssetId);
         if (!asset)
             return c.json({ error: 'Media asset not found' }, 404);
+        if (!scheduler.liveFacebookReelsEnabled && parsed.data.targets.some((target) => target.format === 'FACEBOOK_REELS' && db.getAccount(target.socialAccountId)?.connectionMode === 'LIVE_OFFICIAL'))
+            return c.json({ error: 'Use the designated SyncFlow publisher to schedule live Facebook Reels.' }, 409);
         // Block hard errors (e.g. Facebook Reels > 90s or missing YouTube title)
         const hardErrors = [];
         for (const target of parsed.data.targets) {
@@ -1324,14 +1350,23 @@ export function createApp(params) {
                 scheduledAt: first.scheduledAt,
             }, 400);
         }
-        const content = db.createContentWithJobs({
-            channelId: channel.id,
-            mediaAssetId: asset.id,
-            targetDate: parsed.data.targetDate,
-            masterBrief: parsed.data.masterBrief,
-            platformMetadata: parsed.data.platformMetadata,
-            jobs: jobsToCreate,
-        });
+        let content;
+        try {
+            content = db.createContentWithJobs({
+                channelId: channel.id,
+                mediaAssetId: asset.id,
+                targetDate: parsed.data.targetDate,
+                masterBrief: parsed.data.masterBrief,
+                platformMetadata: parsed.data.platformMetadata,
+                jobs: jobsToCreate,
+            });
+        }
+        catch (error) {
+            if (error instanceof FacebookReelDuplicateError) {
+                return c.json({ error: error.message, code: 'FACEBOOK_REEL_JOB_EXISTS' }, 409);
+            }
+            throw error;
+        }
         for (const j of content.jobs ?? []) {
             db.addJobLog(j.id, 'INFO', 'JOB_CREATED', `สร้างคิวงาน ${j.format} (${j.strategy}) เวลา ${j.scheduledAt}`);
         }
@@ -1368,6 +1403,12 @@ export function createApp(params) {
         });
         const slotByAccount = new Map(resolved.map((s) => [s.socialAccountId, s]));
         const jobs = db.listJobs({ contentItemId: content.id });
+        if (jobs.some((job) => isOfficialFacebookReel(job) &&
+            !['PUBLISHED', 'CANCELLED'].includes(job.status) &&
+            (!scheduler.liveFacebookReelsEnabled || hasFacebookReelIntent(job) ||
+                (job.lockedUntil && Date.parse(job.lockedUntil) >= Date.now())))) {
+            return c.json({ error: 'Manage the existing Facebook Reel in the designated publisher before rescheduling this content.' }, 409);
+        }
         for (const job of jobs) {
             if (job.status === 'PUBLISHED' || job.status === 'CANCELLED')
                 continue;
@@ -1392,9 +1433,22 @@ export function createApp(params) {
         const content = db.getContent(id);
         if (!content)
             return c.json({ error: 'Content not found' }, 404);
-        for (const job of content.jobs ?? []) {
-            if (job.status === 'NATIVE_SCHEDULED') {
-                await scheduler.cancelJob(job.id).catch(() => { });
+        const jobs = content.jobs ?? [];
+        if (jobs.some((job) => isOfficialFacebookReel(job) &&
+            ((job.lockedUntil && Date.parse(job.lockedUntil) >= Date.now()) ||
+                (hasFacebookReelIntent(job) && !['PUBLISHED', 'FAILED', 'NATIVE_SCHEDULED', 'CANCELLED'].includes(job.status))))) {
+            return c.json({ error: 'Verify the existing Facebook Reel before deleting its job record.' }, 409);
+        }
+        for (const job of jobs) {
+            if (job.status !== 'NATIVE_SCHEDULED')
+                continue;
+            try {
+                await scheduler.cancelJob(job.id);
+            }
+            catch (err) {
+                if (isOfficialFacebookReel(job)) {
+                    return c.json({ error: err instanceof Error ? err.message : 'Meta could not confirm cancellation' }, 409);
+                }
             }
         }
         db.deleteContent(id);
@@ -1425,11 +1479,38 @@ export function createApp(params) {
             return c.json({ error: err instanceof Error ? err.message : String(err) }, 400);
         }
     });
+    app.get('/api/jobs/:id/facebook-diagnostics', async (c) => {
+        const job = db.getJob(c.req.param('id'));
+        if (!job || !isOfficialFacebookReel(job))
+            return c.json({ error: 'Facebook Reel job not found' }, 404);
+        const receipt = job.facebookReel;
+        const account = db.getAccountWithSecrets(job.socialAccountId);
+        const token = account?.account.connectionMode === 'LIVE_OFFICIAL' &&
+            account.account.externalAccountId === receipt?.pageId ? account.accessToken : null;
+        const report = await diagnoseFacebookReel({
+            pageId: receipt?.pageId ?? '', videoId: receipt?.videoId ?? '', token,
+        });
+        c.header('Cache-Control', 'no-store');
+        return c.json(report);
+    });
+    app.post('/api/jobs/:id/verify-facebook', async (c) => {
+        try {
+            const job = await scheduler.verifyFacebookReel(c.req.param('id'));
+            return c.json({ job, logs: db.listJobLogs(job.id) });
+        }
+        catch (err) {
+            return c.json({ error: err instanceof Error ? err.message : 'Unable to verify Facebook Reel' }, 409);
+        }
+    });
     app.post('/api/jobs/:id/retry', (c) => {
         const id = c.req.param('id');
         const job = db.getJob(id);
         if (!job)
             return c.json({ error: 'Job not found' }, 404);
+        if (isOfficialFacebookReel(job) &&
+            (!scheduler.liveFacebookReelsEnabled || hasFacebookReelIntent(job) || (job.lockedUntil && Date.parse(job.lockedUntil) >= Date.now()))) {
+            return c.json({ error: 'This Facebook job may already have a Reel. Check its status instead of requeueing.' }, 409);
+        }
         const updated = db.updateJob(id, {
             status: 'QUEUED',
             retryCount: 0,
@@ -1508,7 +1589,7 @@ export function createApp(params) {
             a.sourceMeta?.episodeId === episodeId ||
             a.id === episodeId) ?? null);
     }
-    app.get('/api/integrations/synccut/episodes', (c) => {
+    app.get('/api/integrations/synccut/episodes', async (c) => {
         const settings = db.getSettingsFull();
         try {
             const localData = listSyncCutEpisodes(settings.synccutDataDir);
@@ -1522,8 +1603,19 @@ export function createApp(params) {
                     mergedMap.set(ep.episodeId, ep);
                 }
             }
-            const episodes = Array.from(mergedMap.values());
-            const connected = localData.connected || episodes.length > 0;
+            // Exclude archived cards from the import library while keeping the media
+            // available to existing drafts, completed posts and publish history.
+            const archiveFile = path.join(storage.dataDir, 'archived-synccut-episodes.json');
+            const archiveJson = await fs.promises.readFile(archiveFile, 'utf8').catch((error) => {
+                if (error.code === 'ENOENT')
+                    return '[]';
+                throw error;
+            });
+            const archive = JSON.parse(archiveJson);
+            const archivedEpisodeIds = new Set(Array.isArray(archive) ? archive.filter((id) => typeof id === 'string') : []);
+            const episodes = Array.from(mergedMap.values())
+                .filter((episode) => !archivedEpisodeIds.has(episode.episodeId));
+            const connected = localData.connected || mergedMap.size > 0;
             return c.json({
                 connected,
                 dataDir: localData.connected
@@ -1625,11 +1717,12 @@ export function createApp(params) {
                 hook: cleanTitle || 'คลิปจาก SyncCut Studio',
                 summary: cleanTitle || 'คลิปจาก SyncCut Studio',
                 keyPoints: [],
-                cta: 'กดติดตามไว้ไม่พลาดคลิปใหม่!',
+                cta: '',
                 coreHashtags: [],
                 language: 'th',
                 tone: 'FRIENDLY',
-                isSyntheticMedia: Boolean(asset.sourceMeta?.syntheticMedia ?? true),
+                visualStyle: asset.sourceMeta?.visualStyle,
+                isSyntheticMedia: requiresRealisticAiDisclosure(asset.sourceMeta?.visualStyle, Boolean(asset.sourceMeta?.syntheticMedia ?? true)),
                 coverTimestampMs: Math.round((asset.sourceMeta?.coverTimeSec ?? 0) * 1000),
             };
             const templates = db.listTemplates(parsed.data.channelId);
@@ -1689,8 +1782,11 @@ export function createApp(params) {
                 let createDraft = true;
                 let targetDate = new Date().toISOString().slice(0, 10);
                 let manifestRaw = '';
+                let subtitlesSrt = '';
+                let subtitlesVtt = '';
                 let videoPromise = null;
                 let coverPromise = null;
+                const textFilePromises = [];
                 let origName = 'synccut_video.mp4';
                 let mimeType = 'video/mp4';
                 bb.on('field', (name, val) => {
@@ -1704,10 +1800,36 @@ export function createApp(params) {
                     else if (name === 'manifest') {
                         manifestRaw = val;
                     }
+                    else if (name === 'subtitlesSrt') {
+                        subtitlesSrt = val;
+                    }
+                    else if (name === 'subtitlesVtt') {
+                        subtitlesVtt = val;
+                    }
                 });
                 bb.on('file', (fieldname, fileStream, info) => {
                     if (fieldname === 'cover') {
                         coverPromise = pipeline(fileStream, fs.createWriteStream(tmpCoverPath));
+                    }
+                    else if (fieldname === 'subtitlesSrt' || fieldname === 'subtitlesVtt') {
+                        textFilePromises.push(new Promise((resTxt, rejTxt) => {
+                            const chunks = [];
+                            let total = 0;
+                            fileStream.on('data', (c) => {
+                                total += c.length;
+                                if (total <= 1024 * 1024)
+                                    chunks.push(c);
+                            });
+                            fileStream.on('end', () => {
+                                const text = Buffer.concat(chunks).toString('utf8');
+                                if (fieldname === 'subtitlesSrt')
+                                    subtitlesSrt = text;
+                                else
+                                    subtitlesVtt = text;
+                                resTxt();
+                            });
+                            fileStream.on('error', rejTxt);
+                        }));
                     }
                     else {
                         origName = info.filename || 'synccut_video.mp4';
@@ -1731,6 +1853,7 @@ export function createApp(params) {
                         const [videoSaved] = await Promise.all([
                             videoPromise,
                             coverPromise ?? Promise.resolve(),
+                            ...textFilePromises,
                         ]);
                         if (!channelId) {
                             channelId = db.listChannels()[0]?.id || '';
@@ -1740,6 +1863,8 @@ export function createApp(params) {
                             createDraft,
                             targetDate,
                             manifestRaw,
+                            subtitlesSrt,
+                            subtitlesVtt,
                             hasCover: Boolean(coverPromise),
                             videoSaved,
                             originalFilename: origName,
@@ -1777,6 +1902,9 @@ export function createApp(params) {
                 return `${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')} ${ch.title}`;
             })
                 .join('\n');
+            const realisticSynthetic = typeof manifest.requiresRealisticAiDisclosure === 'boolean'
+                ? manifest.requiresRealisticAiDisclosure
+                : requiresRealisticAiDisclosure(manifest.visualStyle, true);
             const brief = {
                 topic: manifest.content?.topic ||
                     manifest.projectTitle ||
@@ -1797,7 +1925,8 @@ export function createApp(params) {
                 coverHeadline: manifest.cover?.headline,
                 coverSubline: manifest.cover?.subline,
                 sources: manifest.content?.sources,
-                isSyntheticMedia: true,
+                visualStyle: manifest.visualStyle || undefined,
+                isSyntheticMedia: realisticSynthetic,
                 coverTimestampMs: manifest.cover?.timestampMs ?? 0,
             };
             const asset = db.createMediaAsset({
@@ -1816,9 +1945,12 @@ export function createApp(params) {
                     exportId: manifest.exportId || assetId,
                     version: manifest.version,
                     shotCount: manifest.shotCount,
-                    syntheticMedia: true,
+                    visualStyle: manifest.visualStyle || undefined,
+                    syntheticMedia: realisticSynthetic,
                     coverTimeSec: (manifest.cover?.timestampMs ?? 0) / 1000,
                     brief,
+                    ...(parsedUpload.subtitlesSrt ? { subtitlesSrt: parsedUpload.subtitlesSrt } : {}),
+                    ...(parsedUpload.subtitlesVtt ? { subtitlesVtt: parsedUpload.subtitlesVtt } : {}),
                 },
                 mimeType: parsedUpload.mimeType,
                 fileSizeBytes: parsedUpload.videoSaved.sizeBytes,

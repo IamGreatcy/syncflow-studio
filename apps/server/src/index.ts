@@ -6,7 +6,7 @@ import { serve } from '@hono/node-server';
 import { ClipFlowDb } from './db/database.js';
 import { ensureInitialSeed } from './db/seed.js';
 import { StorageService } from './services/storage.js';
-import { SchedulerEngine } from './scheduler/engine.js';
+import { facebookReelRuntime, SchedulerEngine } from './scheduler/engine.js';
 import { createApp } from './app.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -32,7 +32,13 @@ const db = new ClipFlowDb(resolvedDbPath, encryptionKeyOrPath);
 ensureInitialSeed(db);
 
 const storage = new StorageService(dataDir);
-const scheduler = new SchedulerEngine(db, storage);
+const facebookRuntime = facebookReelRuntime(process.env);
+const railwayMount = process.env.RAILWAY_VOLUME_MOUNT_PATH;
+const persistentMountConfigured = Boolean(railwayMount &&
+  (dataDir === path.resolve(railwayMount) || dataDir.startsWith(path.resolve(railwayMount) + path.sep)));
+const facebookPublishingEnabled = facebookRuntime.allowed &&
+  (facebookRuntime.environment === 'local' || persistentMountConfigured);
+const scheduler = new SchedulerEngine(db, storage, facebookPublishingEnabled);
 const webDistDir = path.join(repoRoot, 'apps', 'web', 'dist');
 
 const app = createApp({
@@ -40,6 +46,13 @@ const app = createApp({
   storage,
   scheduler,
   webDistDir,
+  runtime: {
+    ...facebookRuntime,
+    allowed: facebookPublishingEnabled,
+    deploymentId: process.env.RAILWAY_DEPLOYMENT_ID ?? null,
+    commit: process.env.RAILWAY_GIT_COMMIT_SHA ?? null,
+    persistentMountConfigured,
+  },
   onRestartRequested: () => {
     // Exit non-zero so the host (Railway restart policy / Docker) restarts the container
     // and the start command re-pulls the latest release.

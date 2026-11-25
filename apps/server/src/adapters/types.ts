@@ -23,6 +23,9 @@ export interface AdapterContext {
   asset: MediaAsset;
   localFilePath: string;
   thumbnailPath: string | null;
+  hasCustomCover?: boolean;
+  getCoverVideoPath?: () => Promise<string>;
+  onContainerCreated?: (containerId: string, createdAtIso: string) => void;
   settings: AppSettingsFull;
   log: AdapterLogFn;
 }
@@ -58,6 +61,7 @@ export interface OAuthTokenResponse {
   expiresAt?: string | null;
   externalAccountId?: string;
   accountName?: string;
+  creatorInfo?: import('@clipflow/shared').TikTokCreatorInfo | null;
   pairedIgAccount?: {
     igUserId: string;
     igUsername: string | null;

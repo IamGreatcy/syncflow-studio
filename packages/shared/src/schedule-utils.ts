@@ -96,6 +96,23 @@ export function addDaysToDateStr(dateStr: string, days: number): string {
 }
 
 /**
+ * Returns today's or next day's YYYY-MM-DD in the channel's local IANA timezone (avoids UTC off-by-1).
+ */
+export function getLocalTodayDateStr(
+  timezone = 'Asia/Bangkok',
+  now: Date = new Date()
+): string {
+  return getLocalDateTimeParts(now, timezone).dateStr;
+}
+
+export function getNextDayDateStr(
+  timezone = 'Asia/Bangkok',
+  now: Date = new Date()
+): string {
+  return addDaysToDateStr(getLocalTodayDateStr(timezone, now), 1);
+}
+
+/**
  * Formats a Date into { dateStr: "YYYY-MM-DD", localTime: "HH:mm" } in the given IANA timezone.
  */
 export function getLocalDateTimeParts(

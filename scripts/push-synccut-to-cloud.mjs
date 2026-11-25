@@ -135,19 +135,27 @@ async function main() {
   if (opts.targetDate) form.append('targetDate', opts.targetDate);
   form.append('manifest', JSON.stringify(manifest));
 
-  const videoBuf = fs.readFileSync(bestExp.file);
+  const videoBlob = await fs.openAsBlob(bestExp.file, { type: 'video/mp4' });
   form.append(
     'video',
-    new Blob([videoBuf], { type: 'video/mp4' }),
+    videoBlob,
     `${brief.topic || 'synccut_clip'}.mp4`
   );
   if (coverPath) {
-    const coverBuf = fs.readFileSync(coverPath);
+    const coverBlob = await fs.openAsBlob(coverPath, { type: 'image/png' });
     form.append(
       'cover',
-      new Blob([coverBuf], { type: 'image/png' }),
+      coverBlob,
       path.basename(coverPath)
     );
+  }
+  const srtFile = bestExp.srtId ? filesById.get(bestExp.srtId) : null;
+  if (srtFile?.file && fs.existsSync(srtFile.file)) {
+    form.append('subtitlesSrt', fs.readFileSync(srtFile.file, 'utf8'));
+  }
+  const vttFile = bestExp.vttId ? filesById.get(bestExp.vttId) : null;
+  if (vttFile?.file && fs.existsSync(vttFile.file)) {
+    form.append('subtitlesVtt', fs.readFileSync(vttFile.file, 'utf8'));
   }
 
   console.log(

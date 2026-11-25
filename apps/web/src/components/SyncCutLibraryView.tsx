@@ -8,9 +8,10 @@ import {
   Sparkles,
   Upload,
 } from 'lucide-react';
-import type {
-  SyncCutEpisodeSummary,
-  SyncCutImportResponse,
+import {
+  getNextDayDateStr,
+  type SyncCutEpisodeSummary,
+  type SyncCutImportResponse,
 } from '@clipflow/shared';
 import { api, type ChannelWithAccounts } from '../api';
 
@@ -36,7 +37,7 @@ export function SyncCutLibraryView({
   onNotify,
 }: Props) {
   const [targetDate, setTargetDate] = useState<string>(() =>
-    new Date().toISOString().slice(0, 10)
+    getNextDayDateStr(channel.timezone)
   );
   const [importingId, setImportingId] = useState<string | null>(null);
   const [refreshing, setRefreshing] = useState(false);

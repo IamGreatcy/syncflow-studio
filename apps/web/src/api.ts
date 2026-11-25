@@ -454,6 +454,11 @@ export const api = {
       method: 'POST',
     }),
 
+  verifyFacebookReel: (jobId: string) =>
+    req<{ job: PublishJob; logs: JobLog[] }>(`/api/jobs/${jobId}/verify-facebook`, {
+      method: 'POST',
+    }),
+
   retryJob: (jobId: string) =>
     req<{ job: PublishJob }>(`/api/jobs/${jobId}/retry`, { method: 'POST' }),
 

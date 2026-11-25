@@ -217,6 +217,134 @@ function sanitizeCaptionForFormat(
   return text;
 }
 
+export function inferYouTubeCategoryId(
+  brief: MasterBrief,
+  tpl?: MetadataTemplate
+): string {
+  const tplCat = tpl?.platformDefaults?.categoryId;
+  if (typeof tplCat === 'string' && /^\d{1,2}$/.test(tplCat.trim())) {
+    return tplCat.trim();
+  }
+  const sample = `${brief.topic} ${brief.hook} ${brief.summary}`;
+  if (
+    brief.tone === 'EDUCATIONAL' ||
+    /ทำไม|ความลับ|ประวัติ|ตำนาน|รู้หรือไม่|รู้ไหม|ที่มา|วิทยาศาสตร์|จิตวิทยา|ความจริง|อธิบาย|เจาะลึก|สาระ|ความรู้|\b(?:why|history|science|explained|origin|fact|psychology|how\s+it\s+works)\b/iu.test(
+      sample
+    )
+  ) {
+    return '27';
+  }
+  if (
+    brief.tone === 'ENTERTAINING' ||
+    /ถ้าคุณ|สมมติ|มนุษย์คนสุดท้าย|นิยาย|เรื่องสั้น|ผจญภัย/iu.test(sample)
+  ) {
+    return '24';
+  }
+  return '22';
+}
+
+function pickContextualEngagementCta(
+  topic: string,
+  format: ContentFormat,
+  language: MasterBrief['language']
+): string {
+  const seed = `${topic}:${format}`;
+  let hash = 0;
+  for (let i = 0; i < seed.length; i++) {
+    hash = (hash * 31 + seed.charCodeAt(i)) >>> 0;
+  }
+  const thPool: Record<ContentFormat, string[]> = {
+    YOUTUBE_SHORTS: [
+      'คิดยังไงกับเรื่องนี้ คอมเมนต์แลกเปลี่ยนกันครับ',
+      'เพิ่งรู้เหมือนกันไหม? กดติดตามไว้มีอีกหลายตอน!',
+      'เรื่องนี้จริงหรือหลอกในมุมคุณ มาคุยกันในคอมเมนต์',
+      'อยากให้เจาะเรื่องไหนต่อ พิมพ์ไว้ใต้คลิปได้เลยครับ',
+      'ชอบเล่าเรื่องแบบนี้ กดติดตามช่องไว้เลย!',
+    ],
+    YOUTUBE_LONG: [
+      'คิดเห็นยังไงกับประเด็นนี้ คอมเมนต์คุยกันและฝากกด Subscribe ด้วยนะครับ',
+      'มีข้อมูลเสริมหรือเรื่องคล้ายกัน แชร์ไว้ในคอมเมนต์ได้เลยครับ',
+      'อยากให้เจาะลึกเรื่องไหนเป็นตอนต่อไป คอมเมนต์บอกได้เลยครับ',
+      'หากชอบคลิปแนวไขข้อสงสัยแบบนี้ ฝากกดติดตามไว้ด้วยนะครับ',
+      'คุณเคยได้ยินตำนานเรื่องนี้ในเวอร์ชันไหนบ้าง มาคุยกันครับ',
+    ],
+    TIKTOK: [
+      'เพิ่งรู้เหมือนกันไหม? คอมเมนต์คุยกัน 👇',
+      'เรื่องนี้คุณว่าจริงหรือมั่ว? เมนต์บอกหน่อย 👇',
+      'เซฟไว้กันลืม หรือแท็กเพื่อนมาดูด้วยกัน 👇',
+      'เคยสงสัยเรื่องนี้เหมือนกันไหมครับ?',
+      'อยากให้ไขความลับเรื่องไหนต่อ พิมพ์ไว้เลย 👇',
+    ],
+    INSTAGRAM_REELS: [
+      'เซฟเก็บไว้หรือส่งต่อให้เพื่อนที่ชอบเรื่องนี้!',
+      'เคยรู้มาก่อนไหม? แชร์มุมมองในคอมเมนต์ได้เลย',
+      'ส่งให้เพื่อนสายเกร็ดความรู้ดูด้วยกันเลย',
+      'เรื่องนี้เกินคาดเหมือนกันไหม คอมเมนต์บอกหน่อย!',
+      'กด Save เก็บไว้ดูซ้ำได้เลยครับ',
+    ],
+    FACEBOOK_REELS: [
+      'คิดเห็นยังไง คอมเมนต์คุยกันครับ!',
+      'เคยได้ยินเรื่องนี้มาก่อนไหม แชร์ให้เพื่อนรู้ด้วยเลย',
+      'จริงหรือไม่ในมุมคุณ มาคุยกันในคอมเมนต์ครับ',
+      'รู้แล้วอึ้งเหมือนกันไหมครับ คอมเมนต์บอกกันหน่อย',
+      'อยากให้เล่าเรื่องไหนต่อ พิมพ์ไว้ใต้คลิปได้เลยครับ',
+    ],
+    FACEBOOK_VIDEO: [
+      'เห็นด้วยไหมครับ คอมเมนต์คุยกันหรือแชร์ต่อได้เลย!',
+      'คุณคิดยังไงกับเรื่องราวนี้ มาร่วมแลกเปลี่ยนกันในคอมเมนต์ครับ',
+      'หากมีข้อมูลเพิ่มเติมหรืออยากให้ทำตอนไหนต่อ คอมเมนต์บอกได้เลยครับ',
+      'แชร์คลิปนี้เก็บไว้ดูหรือส่งต่อให้เพื่อนที่สนใจได้เลยครับ',
+      'เคยเจอเรื่องราวคล้ายกันไหมครับ เล่าสู่กันฟังได้นะครับ',
+    ],
+  };
+  const enPool: Record<ContentFormat, string[]> = {
+    YOUTUBE_SHORTS: [
+      'Did you know this before? Comment below!',
+      'What do you think? Let’s discuss in the comments!',
+      'Subscribe for more hidden stories & origins!',
+      'Which mystery should we cover next?',
+      'Surprising right? Drop your thoughts below!',
+    ],
+    YOUTUBE_LONG: [
+      'What are your thoughts on this story? Comment & subscribe!',
+      'Did anything surprise you here? Share in the comments!',
+      'Suggest the next topic in the comments below!',
+      'Subscribe for deeper breakdowns every week!',
+      'Have you heard a different version of this? Let us know!',
+    ],
+    TIKTOK: [
+      'Did you know this? Comment below 👇',
+      'Fact or myth in your view? Tell us 👇',
+      'Save this for later or send to a friend 👇',
+      'Ever wondered why? Drop a comment 👇',
+      'What should we explain next? 👇',
+    ],
+    INSTAGRAM_REELS: [
+      'Save & share with someone who loves trivia!',
+      'Did you already know this? Tell us below!',
+      'Send this to a friend who would be surprised!',
+      'Save this Reel so you don’t forget it!',
+      'Drop your take in the comments!',
+    ],
+    FACEBOOK_REELS: [
+      'What do you think? Comment below!',
+      'Did you know this story? Share with a friend!',
+      'Surprising twist or expected? Tell us below!',
+      'Comment what topic you want next!',
+      'Share this fun fact with friends!',
+    ],
+    FACEBOOK_VIDEO: [
+      'Share your thoughts in the comments or pass this along!',
+      'Did this surprise you? Join the discussion below!',
+      'Let us know which story we should explore next!',
+      'Save or share with friends interested in history & facts!',
+      'What’s your perspective? Comment below!',
+    ],
+  };
+  const pool = language === 'en' ? enPool[format] : thPool[format];
+  return pool[hash % pool.length]!;
+}
+
 export function generateMetadataDeterministic(params: {
   brief: MasterBrief;
   formats: ContentFormat[];
@@ -242,6 +370,14 @@ export function generateMetadataDeterministic(params: {
           .map((s) => (s.url ? `• ${s.title}: ${s.url}` : `• ${s.title}`))
           .join('\n')}`
       : '';
+  const shortSourcesLine =
+    sources.length > 0
+      ? `${brief.language === 'en' ? '📚 Ref:' : '📚 อ้างอิง:'} ${sources
+          .slice(0, 2)
+          .map((s) => s.title || s.url)
+          .filter(Boolean)
+          .join(', ')}`
+      : '';
   const coverTitlePart = brief.coverHeadline?.trim() || topic;
   const coverHookPart = [
     brief.coverKicker?.trim(),
@@ -257,7 +393,11 @@ export function generateMetadataDeterministic(params: {
 
   for (const format of formats) {
     const tpl = tplMap.get(format);
-    const cta = briefCta || tpl?.defaultCta || '';
+    const cta =
+      briefCta ||
+      tpl?.defaultCta ||
+      pickContextualEngagementCta(topic, format, brief.language);
+    const ytCategoryId = inferYouTubeCategoryId(brief, tpl);
 
     if (format === 'YOUTUBE_SHORTS') {
       // Mobile Shorts overlays Title at bottom-left (~40-55 chars visible on 1-2 lines before obstructing frame)
@@ -283,13 +423,9 @@ export function generateMetadataDeterministic(params: {
             ? clampString(hook, 120)
             : '';
       if (conciseSummary) parts.push(conciseSummary);
-      const shortCta = cta
-        ? clampString(cta, 55)
-        : brief.language === 'en'
-          ? 'Subscribe for more!'
-          : 'กดติดตามไว้ไม่พลาดคลิปใหม่!';
+      const shortCta = clampString(cta, 65);
       parts.push(shortCta);
-      if (sourcesBlock) parts.push(sourcesBlock);
+      if (shortSourcesLine) parts.push(clampString(shortSourcesLine, 120));
       const hashLine = buildHashtagLine(
         'YOUTUBE_SHORTS',
         briefHashtags,
@@ -317,11 +453,11 @@ export function generateMetadataDeterministic(params: {
         title,
         description,
         tags,
-        categoryId: '22',
+        categoryId: ytCategoryId,
         privacyStatus: 'public',
         madeForKids: false,
         notifySubscribers: true,
-        containsSyntheticMedia: false,
+        containsSyntheticMedia: isSynthetic,
         thumbnailIndex: 0,
       };
     }
@@ -359,9 +495,7 @@ export function generateMetadataDeterministic(params: {
         const tsHead = brief.language === 'en' ? '⏱️ Chapters:' : '⏱️ Chapters:';
         parts.push(`${tsHead}\n${timestamps}`);
       }
-      parts.push(
-        `💬 ${cta || (brief.language === 'en' ? 'Comment your thoughts & subscribe!' : 'คิดเห็นยังไง คอมเมนต์คุยกันและฝากกด Subscribe ด้วยนะครับ')}`
-      );
+      parts.push(`💬 ${cta}`);
       if (sourcesBlock) parts.push(sourcesBlock);
       if (tpl?.descriptionFooter) parts.push(tpl.descriptionFooter);
 
@@ -392,11 +526,11 @@ export function generateMetadataDeterministic(params: {
         title,
         description,
         tags,
-        categoryId: '22',
+        categoryId: ytCategoryId,
         privacyStatus: 'public',
         madeForKids: false,
         notifySubscribers: true,
-        containsSyntheticMedia: false,
+        containsSyntheticMedia: isSynthetic,
         thumbnailIndex: 0,
       };
     }
@@ -405,11 +539,7 @@ export function generateMetadataDeterministic(params: {
       // TikTok overlays caption directly over lower video frame (cuts off at ~80-95 chars).
       // Keep to 2 concise lines (<= 165 chars) so visuals & subtitles stay completely clear!
       const tiktokLead = hook && hook !== coverTitlePart ? hook : coverHookPart || topic;
-      const tiktokCta =
-        cta ||
-        (brief.language === 'en'
-          ? 'Save & comment below 👇'
-          : 'เคยสงสัยไหม? คอมเมนต์หรือ Save เลย 👇');
+      const tiktokCta = cta;
       const hashLine = buildHashtagLine(
         'TIKTOK',
         briefHashtags,
@@ -439,11 +569,7 @@ export function generateMetadataDeterministic(params: {
     if (format === 'INSTAGRAM_REELS') {
       // IG Reels cuts before "...more" around ~65-85 chars and dims lower video when expanded.
       const igLead = hook && hook !== coverTitlePart ? hook : coverHookPart || topic;
-      const igCta =
-        cta ||
-        (brief.language === 'en'
-          ? 'Save & send to a friend!'
-          : 'กด Save หรือส่งต่อให้เพื่อน!');
+      const igCta = cta;
       const hashLine = buildHashtagLine(
         'INSTAGRAM_REELS',
         briefHashtags,
@@ -461,7 +587,7 @@ export function generateMetadataDeterministic(params: {
         caption,
         shareToFeed: true,
         thumbOffsetMs: coverMs,
-        isAiGenerated: false,
+        isAiGenerated: isSynthetic,
       };
     }
 
@@ -477,11 +603,7 @@ export function generateMetadataDeterministic(params: {
           : hook !== coverTitlePart
             ? hook
             : coverHookPart || topic;
-      const fbCta =
-        cta ||
-        (brief.language === 'en'
-          ? 'Comment & share!'
-          : 'คิดเห็นยังไง คอมเมนต์คุยกัน!');
+      const fbCta = cta;
       const hashLine = buildHashtagLine(
         'FACEBOOK_REELS',
         briefHashtags,
@@ -499,7 +621,7 @@ export function generateMetadataDeterministic(params: {
       result.FACEBOOK_REELS = {
         title,
         description,
-        isAiGenerated: false,
+        isAiGenerated: isSynthetic,
       };
     }
 
@@ -523,9 +645,7 @@ export function generateMetadataDeterministic(params: {
             .join('\n')
         );
       }
-      parts.push(
-        `💬 ${cta || (brief.language === 'en' ? 'Comment & share with friends!' : 'เห็นด้วยไหมครับ คอมเมนต์คุยกันหรือแชร์ต่อได้เลย!')}`
-      );
+      parts.push(`💬 ${cta}`);
       if (sourcesBlock) parts.push(sourcesBlock);
       if (tpl?.descriptionFooter) parts.push(tpl.descriptionFooter);
       const hashLine = buildHashtagLine(
@@ -540,7 +660,7 @@ export function generateMetadataDeterministic(params: {
       result.FACEBOOK_VIDEO = {
         title,
         description: clampString(parts.join('\n\n'), 60000),
-        isAiGenerated: false,
+        isAiGenerated: isSynthetic,
       };
     }
   }
@@ -587,7 +707,11 @@ function sanitizeAiPlatformMetadata(
         ? obj.tags.map(String)
         : base.tags;
       const tags = packYouTubeTags(rawTags);
-      out[format] = { ...base, title, description, tags };
+      const categoryId =
+        typeof obj.categoryId === 'string' && /^\d{1,2}$/.test(obj.categoryId.trim())
+          ? obj.categoryId.trim()
+          : base.categoryId;
+      out[format] = { ...base, title, description, tags, categoryId };
     }
 
     if (format === 'TIKTOK' && fallback.TIKTOK) {
@@ -701,6 +825,7 @@ Input Master Brief:
   }
 
 Strict 2026 Platform Strategy & Overlay-Safe Constraints (CRITICAL: Mobile vertical feeds render Title/Caption DIRECTLY ON TOP OF the lower 20-35% of the video! Keep short-form text ultra-concise so it NEVER covers faces/visuals/subtitles and stays above "...more"):
+- Anti-Slop Originality Rule: NEVER reuse generic boilerplate CTA lines (like "กดติดตามไว้ไม่พลาดคลิปใหม่!") across videos. Craft a distinct, topic-specific curiosity or opinion question tailored directly to this episode so every post looks human-authored rather than template-generated.
 - Universal Hashtag Rule: Use ONLY 2 to 4 specific niche/topic hashtags (put keywords naturally in text, avoid hashtag stuffing). NEVER use generic spam tags (#fyp, #foryou, #viral, #trending, #reels, #คลิปสั้น, #TikTokThailand). NEVER leak platform names/tags across platforms (e.g., never put #Shorts on TikTok/IG/FB).
 - YOUTUBE_SHORTS: { "title": "ULTRA-CONCISE <=50 chars (fits 1-2 lines at bottom-left without covering video or truncating), high-curiosity keyword hook, NO < or >", "description": "2 concise lines only (<=220 chars total): 1 crisp searchable Thai takeaway sentence + short Subscribe nudge + #Shorts + 2 niche tags (cite brief sources only if present)", "tags": ["8-12 long-tail Thai/English search queries people actually type, <=500 chars total"] }
 - YOUTUBE_LONG: { "title": "<=70 chars high-CTR + search SEO phrase, NO < or >", "description": "crisp hook + concise summary + short bullet takeaways + Chapters (if timestamps provided) + Sources (if provided) + Subscribe CTA + 3 niche hashtags", "tags": ["10-15 real search phrases, <=500 chars total"] }

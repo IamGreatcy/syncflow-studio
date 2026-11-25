@@ -7,6 +7,11 @@ export declare function zonedDateTimeToUtcIso(dateStr: string, localTime: string
 export declare function getDayOfWeekFromDateStr(dateStr: string): number;
 export declare function addDaysToDateStr(dateStr: string, days: number): string;
 /**
+ * Returns today's or next day's YYYY-MM-DD in the channel's local IANA timezone (avoids UTC off-by-1).
+ */
+export declare function getLocalTodayDateStr(timezone?: string, now?: Date): string;
+export declare function getNextDayDateStr(timezone?: string, now?: Date): string;
+/**
  * Formats a Date into { dateStr: "YYYY-MM-DD", localTime: "HH:mm" } in the given IANA timezone.
  */
 export declare function getLocalDateTimeParts(date: Date, timezone?: string): {

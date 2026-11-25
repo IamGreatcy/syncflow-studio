@@ -1,4 +1,5 @@
 import type { Readable } from 'node:stream';
+import type { MediaProbeInfo } from '@clipflow/shared';
 import type { AppSettingsFull } from '../db/database.js';
 export interface SavedObjectResult {
     storageProvider: 'LOCAL' | 'R2';
@@ -11,6 +12,7 @@ export declare class StorageService {
     readonly dataDir: string;
     readonly uploadsDir: string;
     readonly thumbnailsDir: string;
+    private readonly coverVideoBuilds;
     constructor(baseDataDir?: string);
     private createR2Client;
     resolveLocalPath(storageKey: string): string;
@@ -34,6 +36,13 @@ export declare class StorageService {
     ensureLocalFile(storageKey: string, settings: AppSettingsFull): Promise<string>;
     resolveCustomCoverPath(assetId: string): string;
     ensureCustomCover(assetId: string, settings: AppSettingsFull): Promise<string | null>;
+    ensureCoverPrependedVideo(params: {
+        assetId: string;
+        videoPath: string;
+        coverPath: string;
+        probe: MediaProbeInfo;
+        coverDurationSec?: number;
+    }): Promise<string>;
     saveCustomCoverFromPath(params: {
         assetId: string;
         sourceFilePath: string;

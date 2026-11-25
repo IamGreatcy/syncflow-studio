@@ -2,7 +2,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { randomUUID } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
-import { CONTENT_FORMATS, detectRecommendedFormats, validateFormatMetadata, validateVideoCompatibility, } from '@clipflow/shared';
+import { CONTENT_FORMATS, detectRecommendedFormats, requiresRealisticAiDisclosure, validateFormatMetadata, validateVideoCompatibility, } from '@clipflow/shared';
 import { extractThumbnails, probeVideo } from './media.js';
 import { generateMetadataWithAI } from './metadata-engine.js';
 export function stripCoverMarkdown(text) {
@@ -204,12 +204,13 @@ export function extractBriefFromSyncCutEpisode(ep, exportRec) {
     }));
     const combinedSample = `${topic} ${transcriptText}`;
     const hasThai = /[\u0E00-\u0E7F]/.test(combinedSample);
+    const visualStyle = ep.production?.visualStyle || undefined;
     return {
         topic,
         hook,
         summary,
         keyPoints,
-        cta: 'กดติดตามและบันทึกคลิปนี้ไว้ดูย้อนหลังได้เลยครับ',
+        cta: '',
         coreHashtags,
         language: hasThai ? 'th' : 'en',
         tone: 'FRIENDLY',
@@ -219,7 +220,8 @@ export function extractBriefFromSyncCutEpisode(ep, exportRec) {
         coverHeadline: coverHeadline || undefined,
         coverSubline: coverSubline || undefined,
         sources: sources.length > 0 ? sources : undefined,
-        isSyntheticMedia: true,
+        visualStyle,
+        isSyntheticMedia: requiresRealisticAiDisclosure(visualStyle, true),
         coverTimestampMs: Math.max(0, Math.round(Number(ep.delivery?.coverTime ?? 0) * 1000)),
     };
 }
@@ -287,7 +289,8 @@ export async function importSyncCutEpisode(params) {
             episodeId: episode.id,
             exportId: bestExp.id,
             coverTimeSec: Number(episode.delivery?.coverTime ?? 0),
-            syntheticMedia: true,
+            visualStyle: episode.production?.visualStyle || undefined,
+            syntheticMedia: requiresRealisticAiDisclosure(episode.production?.visualStyle, true),
         },
         mimeType: 'video/mp4',
         fileSizeBytes: saved.sizeBytes,
